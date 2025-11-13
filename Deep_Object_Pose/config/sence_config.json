@@ -1,0 +1,33 @@
+{
+  "rotational_range": {
+    "default": {
+      "pitch": [
+        -10,
+        10
+      ],
+      "yaw": [
+        -10,
+        10
+      ],
+      "roll": [
+        -10,
+        10
+      ]
+    }
+  },
+  "HDRI_backgrounds": {
+    "enabled": true,
+    "selection_method": "iterate",
+    "count": "all",
+    "strength_range": [
+      0.5,
+      1.5
+    ]
+  },
+  "backgrounds": {
+    "enabled": true,
+    "selection_method": "iterate",
+    "count": "all"
+  },
+  "race_tracing": true
+}

@@ -1,0 +1,18 @@
+services:
+  dope:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: dope-dev:latest
+    container_name: dope_dev
+    working_dir: /workspace/Deep_Object_Pose
+    volumes:
+      - ./Deep_Object_Pose:/workspace/Deep_Object_Pose
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+    gpus: all
+    shm_size: "8g"
+    tty: true
+    stdin_open: true
+    command: bash

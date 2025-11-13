@@ -1,0 +1,96 @@
+#!/usr/bin/env python3
+
+import json
+import numpy as np
+import os
+from pathlib import Path
+from PIL import Image, ImageDraw
+from pyquaternion import Quaternion
+import sys
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+COMMON_DIR = REPO_ROOT / "common"
+if str(COMMON_DIR) not in sys.path:
+    sys.path.append(str(COMMON_DIR))
+
+from cuboid import CuboidVertexType
+
+def main(json_files):
+    for json_fn in json_files:
+        # Find corresponding PNG
+        base, _ = os.path.splitext(json_fn)
+        img_fn = base+'.png'
+        if not os.path.isfile(img_fn):
+            print(f"Could not locate '{img_fn}'. Skipping..")
+            continue
+
+        # Load JSON data
+        with open(json_fn, 'r') as F:
+            data_json = json.load(F)
+
+        img = Image.open(img_fn)
+
+        objects = data_json['objects']
+        # draw projected cuboid dots
+        for oo in objects:
+            draw = ImageDraw.Draw(img)
+            pts = oo['projected_cuboid']
+            for idx, pt in enumerate(pts):
+                pos = (pt[0]-2, pt[1]-2, pt[0]+2, pt[1]+2)
+                draw.ellipse(pos, fill = 'cyan', outline ='cyan')
+                pos = (pos[0]-4, pos[1]-4)
+                draw.text(pos, str(idx), align ="left")
+
+            # Note that the enum names DO NOT MATCH the positions of the points
+            # when projected into 3D. This is an old bug that will not be fixed,
+            # as it will result in errors in inference in older trained models
+            line_order = [
+                # Front
+                [CuboidVertexType.FrontTopRight,    CuboidVertexType.FrontTopLeft,     'red'],
+                [CuboidVertexType.FrontTopLeft,     CuboidVertexType.FrontBottomLeft,  'red'],
+                [CuboidVertexType.FrontBottomRight, CuboidVertexType.FrontBottomLeft,  'red'],
+                [CuboidVertexType.FrontBottomRight, CuboidVertexType.FrontTopRight,    'red'],
+                # Rear
+                [CuboidVertexType.RearTopRight,     CuboidVertexType.RearTopLeft,      'cyan'],
+                [CuboidVertexType.RearBottomLeft,   CuboidVertexType.RearTopLeft,      'cyan'],
+                [CuboidVertexType.RearBottomLeft,   CuboidVertexType.RearBottomRight,  'cyan'],
+                [CuboidVertexType.RearTopRight,     CuboidVertexType.RearBottomRight,  'cyan'],
+                # Sides
+                [CuboidVertexType.FrontTopRight,    CuboidVertexType.RearTopRight,     'green'],
+                [CuboidVertexType.RearBottomRight,  CuboidVertexType.FrontBottomRight, 'green'],
+                [CuboidVertexType.RearTopLeft,      CuboidVertexType.FrontTopLeft,     'cyan'],
+                [CuboidVertexType.FrontBottomLeft,  CuboidVertexType.RearBottomLeft,   'cyan'],
+                # 'X' on top
+                [CuboidVertexType.FrontTopRight,    CuboidVertexType.RearTopLeft,      'cyan'],
+                [CuboidVertexType.FrontTopLeft,     CuboidVertexType.RearTopRight,     'cyan']
+            ]
+
+            for ll in line_order:
+                draw.line([(pts[ll[0]][0],pts[ll[0]][1]), (pts[ll[1]][0],pts[ll[1]][1])],
+                           fill=ll[2], width=1)
+
+        img.save(base+'-output.png')
+
+
+def usage_msg(script_name):
+    print(f"Usage: {script_name} _JSON FILES_")
+    print("  The basename of the JSON files in _FILES_ will be used to find its")
+    print("  corresponding image file; i.e. if `00001.json` is provided, the code")
+    print("  will look for an image named `00001.png`")
+
+
+if __name__ == "__main__":
+    # Print out usage information if there are no arguments
+    if len(sys.argv) < 2:
+        usage_msg(sys.argv[0])
+        exit(0)
+
+    # ..or if the first argument is a request for help
+    s = sys.argv[1].lstrip('-')
+    if s == "h" or s == "help":
+        usage_msg(sys.argv[0])
+        exit(0)
+
+    main(sys.argv[1:])
+
+
