@@ -1,0 +1,16 @@
+data/
+output/
+__pycache__/
+*.log
+*.tmp
+*.bak
+*.aux
+*.out
+*.toc
+*.lof
+*.lot
+*.fls
+*.fdb_latexmk
+*.synctex.gz
+.vscode/
+.DS_Store
