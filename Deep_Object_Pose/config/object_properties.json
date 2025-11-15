@@ -7,14 +7,8 @@
         "color_list": [],
         "intensity": [
           1000,
-          10000
-        ],
-        "glare": {
-          "enabled": false,
-          "size": 5,
-          "threshold": 0.2,
-          "mix": 0.0
-        }
+          5000
+        ]
       }
     ]
   }

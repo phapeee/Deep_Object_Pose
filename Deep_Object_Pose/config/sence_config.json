@@ -2,16 +2,16 @@
   "rotational_range": {
     "default": {
       "pitch": [
-        -10,
-        10
+        -180,
+        180
       ],
       "yaw": [
-        -10,
-        10
+        -5,
+        5
       ],
       "roll": [
-        -10,
-        10
+        -5,
+        5
       ]
     }
   },
@@ -20,14 +20,8 @@
     "selection_method": "iterate",
     "count": "all",
     "strength_range": [
-      0.5,
-      1.5
+      0.1,
+      0.5
     ]
-  },
-  "backgrounds": {
-    "enabled": true,
-    "selection_method": "iterate",
-    "count": "all"
-  },
-  "race_tracing": true
+  }
 }

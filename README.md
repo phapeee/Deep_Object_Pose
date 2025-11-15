@@ -1,7 +1,7 @@
 # Data generation
 ```bash
 # in project root
-python3 ./data_generation/blenderproc_data_gen/run_blenderproc_datagen.py --nb_runs 1 --frames_per_cycle 1 --path_single_obj ./data/models/antenna/antenna.obj --nb_objects 1 --object_class Antenna --distractors_folder ./data/google_scanned_models/ --nb_distractors 5 --backgrounds_folder ./data/dome_hdri_haven/ --outf ./data/AntennaData
+python3 ./data_generation/blenderproc_data_gen/run_blenderproc_datagen.py --nb_runs 8 --frames_per_cycle 10 --path_single_obj ./data/models/antenna/antenna.obj --nb_objects 1 --object_class Antenna --distractors_folder ./data/google_scanned_models/ --nb_distractors 5 --backgrounds_folder ./data/dome_hdri_haven/ --outf ./data/AntennaData
 ```
 Optional: limit object rotations by creating `config/sence_config.json` (or pass `--rotation_config <path>`). Wrap the ranges inside the `rotational_range` key:
 ```json
