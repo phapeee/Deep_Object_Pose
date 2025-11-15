@@ -257,17 +257,30 @@ class ModelData(object):
         model_loading_start_time = time.time()
         print("Loading DOPE model '{}'...".format(path))
         net = DopeNetwork().cuda()
-        state_dict = torch.load(path)
+        state_dict = torch.load(path, map_location="cuda")
 
-        if self.parallel:
-            # we must alter the layer names
+        # Some checkpoints may store the state dict under a key (e.g. {"state_dict": ...})
+        if isinstance(state_dict, dict) and "state_dict" in state_dict:
+            state_dict = state_dict["state_dict"]
+
+        def _strip_module(sd):
             new_state_dict = OrderedDict()
-            for k,v in state_dict.items():
-                name = k[7:] # remove `module.`
+            for k, v in sd.items():
+                name = k[7:] if k.startswith("module.") else k
                 new_state_dict[name] = v
-            state_dict = new_state_dict
+            return new_state_dict
 
-        net.load_state_dict(state_dict)
+        if self.parallel or any(k.startswith("module.") for k in state_dict.keys()):
+            state_dict = _strip_module(state_dict)
+
+        try:
+            net.load_state_dict(state_dict)
+        except RuntimeError as exc:
+            # Attempt a final fallback by stripping module prefixes if not already done
+            if not any(k.startswith("module.") for k in state_dict.keys()):
+                raise
+            fallback_state_dict = _strip_module(state_dict)
+            net.load_state_dict(fallback_state_dict)
         net.eval()
         print(
             "    Model loaded in {:.2f} seconds.".format(
@@ -459,7 +472,13 @@ class ObjectDetector(object):
 
     @staticmethod
     def detect_object_in_image(
-        net_model, pnp_solver, in_img, config, grid_belief_debug=False, norm_belief=True
+        net_model,
+        pnp_solver,
+        in_img,
+        config,
+        grid_belief_debug=False,
+        norm_belief=True,
+        silent=False,
     ):
         """Detect objects in a image using a specific trained network model
         Returns the poses of the objects and the belief maps
@@ -468,7 +487,7 @@ class ObjectDetector(object):
         if in_img is None:
             return []
 
-        print("detect_object_in_image - image shape: {}".format(in_img.shape))
+        # print("detect_object_in_image - image shape: {}".format(in_img.shape))
 
         # Run network inference
         image_tensor = transform(in_img)
@@ -481,7 +500,7 @@ class ObjectDetector(object):
 
         # Find objects from network output
         detected_objects = ObjectDetector.find_object_poses(
-            vertex2, aff, pnp_solver, config
+            vertex2, aff, pnp_solver, config, silent=silent
         )
 
         if not grid_belief_debug:
@@ -537,6 +556,7 @@ class ObjectDetector(object):
         run_sampling=False,
         num_sample=100,
         scale_factor=8,
+        silent=False,
     ):
         """Detect objects given network output"""
 
@@ -557,9 +577,11 @@ class ObjectDetector(object):
             # Run PNP
             points = obj[1] + [(obj[0][0] * scale_factor, obj[0][1] * scale_factor)]
             if None in points:
-                print("Incomplete cuboid detection.")
-                print("  result from detection:", points)
-                print("Skipping.")
+                if not silent:
+                    print("Incomplete cuboid detection.")
+                # print("  result from detection:", points)
+                if not silent:
+                    print("Skipping.")
                 continue
 
             cuboid2d = np.copy(points)

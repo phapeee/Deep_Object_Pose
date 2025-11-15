@@ -19,15 +19,30 @@ The `inference.py` script will take a trained model to run inference. In order t
 2. ``--data`: path to the data that will be used as input to run inference on. The script **recursively** loads all data that end with extensions specified in the `--exts` flag.
 3. `--object`: name of the class to run detections on. This name must be defined under `dimensions` in the config file passed to `--config`.
 
+You can either point `--config` and `--camera` directly at YAML files, or provide `--config_dir <folder>` and let the script automatically pick the first matching `config_pose*.yaml` and `camera*.yaml` inside that directory.
+
 Below is an example of running inference:
 
 ```
-python inference.py --weights ../weights --data ../sample_data --object cracker
+python inference.py --config_dir ../config --weights ../weights --data ../sample_data --object cracker
 ```
 
 ### Configuration Files
 Depending on the images you want to run inference on, you may need to redefine the configuration values in `camera_info.yaml` and `config_pose.yaml`.
-You can either define a new configuration file and specify it with `--config` and `--camera` or update `camera_info.yaml` and `config_pose.yaml`.
+You can either define a new configuration file and specify it with `--config` and `--camera`, or place them in a directory and supply `--config_dir` so they are picked up automatically.
+
+### Video Inference
+To run inference over a prerecorded video (logging FPS as it processes frames):
+
+```
+python inference.py --config_dir ../config --weights ../weights --object cracker \
+  --video ../sample_data/demo.mp4 --video_display --silence-detection \
+  --video_out ../output/demo_annotated.mp4
+```
+
+Add `--silence-detection` to suppress per-frame detection warnings (useful when streaming video or webcam feeds). Without it, messages like “Incomplete cuboid detection” may appear whenever detections fail.
+
+Pass `--video_out <path>` to render the annotated frames into a video file after processing is complete. Use `--video_out_fps` if you need to override the FPS embedded in the source file.
 
 Before running inference, it is important to make sure that: 
 1. The `projection_matrix` field is set properly in `camera_info.yaml` (or the file you specified for `--camera`). 

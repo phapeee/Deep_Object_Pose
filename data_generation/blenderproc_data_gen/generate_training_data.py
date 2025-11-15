@@ -5,16 +5,21 @@ from blenderproc.python.utility.Utility import Utility
 import bpy
 
 import argparse
+import copy
 import cv2
 import glob
 import json
 from math import acos, atan, cos, pi, sin, sqrt
 import numpy as np
 import os
+from pathlib import Path
 from PIL import Image, ImageDraw
 from pyquaternion import Quaternion
 import random
 import sys
+
+HDR_FILE_EXTENSIONS = (".hdr", ".exr")
+LDR_IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff")
 
 
 def random_object_position(near=5.0, far=40.0):
@@ -94,12 +99,722 @@ def Rz(A):
 def ur():
     return 2.0*random.random() - 1.0
 
-def random_rotation_matrix(max_angle=180):
-    mr = pi*(max_angle/180.0)
+def random_rotation_matrix(ranges=None, max_angle=180):
+    """Return rotation matrix with optional per-axis ranges in degrees."""
+    if ranges is not None:
+        def pick_angle(axis):
+            deg_range = ranges.get(axis, [-max_angle, max_angle])
+            return pi * (random.uniform(deg_range[0], deg_range[1]) / 180.0)
+        rx = pick_angle("pitch")
+        ry = pick_angle("yaw")
+        rz = pick_angle("roll")
+    else:
+        mr = pi*(max_angle/180.0)
+        rx = mr*ur()
+        ry = mr*ur()
+        rz = mr*ur()
     # Orient the board so a white square (sq #0) in UL corner
     RY = Ry(-0.5*pi)
     # add some random rotations
-    return RY @ Rx(mr*ur()) @ Ry(mr*ur()) @ Rz(mr*ur())
+    return RY @ Rx(rx) @ Ry(ry) @ Rz(rz)
+
+
+def _default_config_path(filename):
+    """Prefer the repo-wide config directory, fall back to legacy location."""
+    repo_root = Path(__file__).resolve().parents[2]
+    config_candidate = repo_root / "config" / filename
+    if config_candidate.is_file():
+        return config_candidate
+    legacy_candidate = Path(__file__).with_name(filename)
+    if legacy_candidate.is_file():
+        return legacy_candidate
+    return None
+
+
+def load_sence_config_data(config_path):
+    candidate = None
+    if config_path:
+        candidate = Path(config_path)
+    else:
+        candidate = _default_config_path("sence_config.json")
+        if candidate is None:
+            candidate = _default_config_path("rotation_config.json")
+    if candidate is None:
+        return None
+    if not candidate.is_file():
+        print(f"Sence config file '{candidate}' not found, ignoring.")
+        return None
+    try:
+        return json.loads(candidate.read_text())
+    except Exception as exc:
+        print(f"Failed to read sence config '{candidate}': {exc}")
+        return None
+
+
+def load_rotation_config(config_path, config_data=None):
+    """Load per-class rotation limits from JSON."""
+    data = config_data if config_data is not None else load_sence_config_data(config_path)
+    if not data:
+        return None
+
+    raw_ranges = data
+    if isinstance(data, dict) and isinstance(data.get("rotational_range"), dict):
+        raw_ranges = data["rotational_range"]
+
+    normalized = {}
+
+    def sanitize_range(values):
+        if isinstance(values, (list, tuple)) and len(values) == 2:
+            lo = float(values[0])
+            hi = float(values[1])
+            return [min(lo, hi), max(lo, hi)]
+        return None
+
+    for key, ranges in raw_ranges.items():
+        if not isinstance(ranges, dict):
+            continue
+        entry = {}
+        for axis in ("pitch", "yaw", "roll"):
+            rng = sanitize_range(ranges.get(axis))
+            if rng is not None:
+                entry[axis] = rng
+        normalized[key.lower()] = entry
+
+    return normalized if normalized else None
+
+
+def load_hdri_background_config(config_path, config_data=None):
+    data = config_data if config_data is not None else load_sence_config_data(config_path)
+    if not data:
+        return None
+    hdri_cfg = data.get("HDRI_backgrounds") or data.get("hdri_backgrounds")
+    if not isinstance(hdri_cfg, dict):
+        return None
+    if not bool(hdri_cfg.get("enabled", False)):
+        return None
+    selection = str(hdri_cfg.get("selection_method", "random")).strip().lower()
+    if selection not in {"random", "iterate"}:
+        selection = "random"
+    strength_vals = hdri_cfg.get("strength_range", [0.5, 1.5])
+    low, high = 0.5, 1.5
+    if isinstance(strength_vals, (list, tuple)) and len(strength_vals) >= 2:
+        try:
+            low = float(strength_vals[0])
+            high = float(strength_vals[1])
+        except (TypeError, ValueError):
+            low, high = 0.5, 1.5
+    if low > high:
+        low, high = high, low
+    raw_count = hdri_cfg.get("count")
+    count_value = None
+    if isinstance(raw_count, str):
+        if raw_count.strip().lower() == "all":
+            count_value = "all"
+        else:
+            try:
+                count_value = int(raw_count)
+            except ValueError:
+                count_value = None
+    elif isinstance(raw_count, (int, float)):
+        count_value = int(raw_count)
+    if isinstance(count_value, int) and count_value < 1:
+        count_value = None
+
+    return {
+        "selection_method": selection,
+        "strength_range": (low, high),
+        "count": count_value
+    }
+
+
+def load_background_overlay_config(config_path, config_data=None):
+    data = config_data if config_data is not None else load_sence_config_data(config_path)
+    if not data:
+        return None
+    bg_cfg = data.get("backgrounds") or data.get("background_images")
+    if not isinstance(bg_cfg, dict):
+        return None
+    if not bool(bg_cfg.get("enabled", False)):
+        return None
+    selection = str(bg_cfg.get("selection_method", "random")).strip().lower()
+    if selection == "all":
+        selection = "iterate"
+    if selection not in {"random", "iterate"}:
+        selection = "random"
+    count = bg_cfg.get("count")
+    if count is not None:
+        try:
+            count = int(count)
+        except (TypeError, ValueError):
+            count = None
+        if count is not None and count < 1:
+            count = None
+    folder_value = bg_cfg.get("folder") or bg_cfg.get("path") or bg_cfg.get("dataset")
+    repo_root = Path(__file__).resolve().parents[2]
+    folder_path = Path(folder_value) if folder_value else (repo_root / "data" / "background_images")
+    return {
+        "selection_method": selection,
+        "count": count,
+        "folder": folder_path
+    }
+
+
+def load_scene_rotation_config(config_path, config_data=None):
+    data = config_data if config_data is not None else load_sence_config_data(config_path)
+    if not data:
+        return None
+    rot_cfg = data.get("sence_rotation") or data.get("scene_rotation")
+    if not isinstance(rot_cfg, dict):
+        return None
+    if not bool(rot_cfg.get("enabled", False)):
+        return None
+
+    def parse_axis(name):
+        values = rot_cfg.get(f"{name}_range")
+        if not isinstance(values, (list, tuple)) or len(values) < 2:
+            return (0.0, 0.0)
+        try:
+            lo = float(values[0])
+            hi = float(values[1])
+        except (TypeError, ValueError):
+            lo = hi = 0.0
+        if lo > hi:
+            lo, hi = hi, lo
+        # convert degrees to radians
+        lo = lo * (pi / 180.0)
+        hi = hi * (pi / 180.0)
+        return (lo, hi)
+
+    return {
+        "pitch": parse_axis("pitch"),
+        "yaw": parse_axis("yaw"),
+        "roll": parse_axis("roll")
+    }
+
+
+def select_backgrounds_for_hdr(runtime):
+    if not runtime or not runtime["paths"]:
+        return [None]
+    method = runtime["method"]
+    paths = runtime["paths"]
+    if method == "random":
+        sample_size = runtime.get("random_count", 1)
+        sample_size = max(1, min(sample_size, len(paths)))
+        return random.sample(paths, sample_size)
+    if method == "iterate":
+        chunk = runtime["chunk_size"]
+        start = runtime["index"]
+        selected = []
+        for i in range(chunk):
+            idx = (start + i) % len(paths)
+            selected.append(paths[idx])
+        runtime["index"] = (start + chunk) % len(paths)
+        return selected
+    return [None]
+
+
+def get_rotation_ranges(rotation_config, class_name, object_settings=None):
+    if object_settings and object_settings.get("rotational_range"):
+        return object_settings["rotational_range"]
+    if not rotation_config:
+        return None
+    cls = class_name.lower()
+    if cls in rotation_config and rotation_config[cls]:
+        return rotation_config[cls]
+    return rotation_config.get("default")
+
+
+def load_object_properties_config(config_path):
+    candidate = None
+    if config_path:
+        candidate = Path(config_path)
+    else:
+        candidate = _default_config_path("object_properties.json")
+    if candidate is None:
+        return None
+    if not candidate.is_file():
+        print(f"Object property config file '{candidate}' not found, ignoring.")
+        return None
+    try:
+        data = json.loads(candidate.read_text())
+    except Exception as exc:
+        print(f"Failed to read object property config '{candidate}': {exc}")
+        return None
+
+    normalized = {}
+    def normalize_emissive(entry):
+        if isinstance(entry, dict):
+            return [entry]
+        elif isinstance(entry, list):
+            return entry
+        return None
+
+    def normalize_glare_settings(glare_value):
+        defaults = {
+            "enabled": False,
+            "threshold": 0.7,
+            "mix": 0.0,
+            "size": 6
+        }
+        if isinstance(glare_value, dict):
+            normalized = defaults.copy()
+            for key in defaults:
+                if glare_value.get(key) is not None:
+                    normalized[key] = glare_value[key]
+            normalized["enabled"] = bool(normalized["enabled"])
+            return normalized
+        if isinstance(glare_value, bool):
+            normalized = defaults.copy()
+            normalized["enabled"] = glare_value
+            return normalized
+        return None
+
+    def normalize_flag(value):
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(value)
+        if isinstance(value, str):
+            val = value.strip().lower()
+            if val in {"true", "1", "yes", "on"}:
+                return True
+            if val in {"false", "0", "no", "off"}:
+                return False
+        return bool(value)
+
+    def normalize_range_pair(values):
+        if isinstance(values, (list, tuple)) and len(values) >= 2:
+            try:
+                lo = float(values[0])
+                hi = float(values[1])
+            except (TypeError, ValueError):
+                return None
+            if lo > hi:
+                lo, hi = hi, lo
+            return [lo, hi]
+        return None
+
+    def normalize_rotational_limits(raw):
+        if not isinstance(raw, dict):
+            return None
+        cleaned = {}
+        for axis in ("pitch", "yaw", "roll"):
+            rng = normalize_range_pair(raw.get(axis))
+            if rng is not None:
+                cleaned[axis] = rng
+        return cleaned or None
+
+    for cls, props in data.items():
+        if not isinstance(props, dict):
+            continue
+        entry = {}
+        emissive = props.get("emissive") or props.get("Emissive")
+        emissive = normalize_emissive(emissive)
+        if emissive:
+            cleaned = []
+            for item in emissive:
+                if not isinstance(item, dict):
+                    continue
+                cleaned.append({
+                    "body": item.get("body"),
+                    "color": item.get("color"),
+                    "color_list": item.get("color_list"),
+                    "intensity": item.get("intensity", 5.0),
+                    "alpha": item.get("alpha", 1.0),
+                    "status": item.get("status", "on"),
+                    "glare": normalize_glare_settings(item.get("glare"))
+                })
+            if cleaned:
+                entry["emissive"] = cleaned
+        excludes = props.get("exclude_parts") or props.get("ExcludeParts")
+        if isinstance(excludes, list):
+            cleaned_excludes = []
+            for item in excludes:
+                if not isinstance(item, dict):
+                    continue
+                name = item.get("name")
+                if not name:
+                    continue
+                cleaned_excludes.append({
+                    "name": str(name),
+                    "visible": normalize_flag(item.get("visible")),
+                    "in_bbox": normalize_flag(item.get("in_bbox"))
+                })
+            if cleaned_excludes:
+                entry["exclude_parts"] = cleaned_excludes
+        rotation_limits = props.get("rotational_range") or props.get("RotationalRange")
+        rotation_limits = normalize_rotational_limits(rotation_limits)
+        if rotation_limits:
+            entry["rotational_range"] = rotation_limits
+        if entry:
+            normalized[cls.lower()] = entry
+    return normalized if normalized else None
+
+def setup_compositor_glare(glare_settings=None):
+    """
+    Set up Blender's compositor to add a glare/bloom effect based on bright pixels.
+
+    glare_settings: dict with keys:
+        enabled   -> if False or missing, compositor stays off.
+        threshold -> brightness threshold for glare (lower = more glow).
+        mix       -> Blender's glare mix (-1 original, 0 mix, 1 glare only).
+        size      -> glare radius (Blender accepts 1..9 but we clamp 1..9).
+    """
+    settings = glare_settings or {}
+    enable_glare = bool(settings.get("enabled"))
+    threshold = settings.get("threshold", 0.7)
+    mix = settings.get("mix", 0.0)
+    size = settings.get("size", 6)
+    try:
+        threshold = float(threshold)
+    except (TypeError, ValueError):
+        threshold = 0.7
+    try:
+        mix = float(mix)
+    except (TypeError, ValueError):
+        mix = 0.0
+    try:
+        size = int(round(float(size)))
+    except (TypeError, ValueError):
+        size = 6
+    size = max(1, min(9, size))
+
+    scene = bpy.context.scene
+
+    if not enable_glare:
+        # Use default (no compositor) if glare is disabled
+        scene.use_nodes = False
+        return
+
+    scene.use_nodes = True
+    tree = scene.node_tree
+    nodes = tree.nodes
+    links = tree.links
+
+    # Clear any existing compositor setup
+    nodes.clear()
+
+    # Render Layers node (input from renderer)
+    rl = nodes.new(type="CompositorNodeRLayers")
+    rl.location = (-300, 0)
+
+    # Glare node
+    glare = nodes.new(type="CompositorNodeGlare")
+    glare.location = (0, 0)
+    glare.glare_type = 'FOG_GLOW'   # nice soft bloom
+    glare.quality = 'HIGH'
+    glare.threshold = threshold
+    glare.mix = mix
+    glare.size = size
+
+    # Composite output (final image)
+    comp = nodes.new(type="CompositorNodeComposite")
+    comp.location = (300, 0)
+
+    # Wire them up: RenderLayers -> Glare -> Composite
+    links.new(rl.outputs["Image"], glare.inputs["Image"])
+    links.new(glare.outputs["Image"], comp.inputs["Image"])
+
+def get_object_properties(properties_config, class_name):
+    if not properties_config:
+        return None
+    cls = class_name.lower()
+    base = None
+    if cls in properties_config:
+        base = properties_config[cls]
+    elif "default" in properties_config:
+        base = properties_config["default"]
+    if base:
+        return copy.deepcopy(base)
+    return None
+
+
+_missing_emissive_targets = set()
+_missing_exclude_targets = set()
+
+
+def _match_subparts_by_name(subparts, target_name, missing_registry, class_name, purpose):
+    """Return list of subparts whose Blender name contains target_name (case-insensitive)."""
+    if not subparts:
+        return []
+    target = (target_name or "").strip()
+    if not target:
+        return list(subparts)
+    target_lower = target.lower()
+    matches = []
+    for part in subparts:
+        try:
+            name = part.get_name() or ""
+        except Exception:
+            name = ""
+        if target_lower in name.lower():
+            matches.append(part)
+    if not matches and missing_registry is not None:
+        key = f"{class_name}:{target_lower}"
+        if key not in missing_registry:
+            missing_registry.add(key)
+            print(f"Warning: Could not find part named '{target}' for class '{class_name}' when applying {purpose}.")
+    return matches
+
+
+def apply_exclude_part_settings(subparts, exclude_cfg, class_name):
+    """Toggle part visibility based on exclude_parts config entries."""
+    if not exclude_cfg:
+        return
+    for entry in exclude_cfg:
+        targets = _match_subparts_by_name(
+            subparts,
+            entry.get("name"),
+            _missing_exclude_targets,
+            class_name,
+            "exclude_parts visibility",
+        )
+        if not targets:
+            continue
+        visible = entry.get("visible")
+        if visible is None:
+            continue
+        visibility_flag = bool(visible)
+        for part in targets:
+            _set_part_visibility(part, visibility_flag)
+
+
+def _set_part_visibility(part, visible):
+    """Hide or show the given MeshObject by toggling Blender visibility flags."""
+    blender_obj = getattr(part, "blender_obj", None)
+    if blender_obj is None:
+        return
+    try:
+        blender_obj.hide_render = not visible
+    except Exception:
+        pass
+    try:
+        blender_obj.hide_viewport = not visible
+    except Exception:
+        pass
+    try:
+        blender_obj.hide_set(not visible)
+    except Exception:
+        pass
+
+
+def prepare_bbox_part_overrides(subparts, properties, class_name):
+    """
+    Precompute which mesh parts should contribute to the cuboid bounding box.
+
+    Returns:
+        None if default behavior should be used, or a list of MeshObjects that
+        remain after exclusions.
+    """
+    if not properties:
+        return None
+    exclude_cfg = properties.get("exclude_parts")
+    if not exclude_cfg:
+        return None
+    include_list = list(subparts)
+    custom_bbox = False
+    for entry in exclude_cfg:
+        targets = _match_subparts_by_name(
+            subparts,
+            entry.get("name"),
+            _missing_exclude_targets,
+            class_name,
+            "exclude_parts in_bbox",
+        )
+        if not targets:
+            continue
+        in_bbox = entry.get("in_bbox")
+        if in_bbox is None:
+            continue
+        in_bbox_flag = bool(in_bbox)
+        for part in targets:
+            if in_bbox_flag:
+                if part not in include_list:
+                    include_list.append(part)
+            else:
+                custom_bbox = True
+                if part in include_list:
+                    include_list.remove(part)
+    if not custom_bbox:
+        return None
+    if not include_list:
+        print(f"Warning: All parts were excluded from bounding box for class '{class_name}'. Falling back to full mesh.")
+        return None
+    return include_list
+
+
+def compute_bbox_override_points(parts, rotation, translation, scale):
+    """
+    Build custom bounding box corner coordinates based on a subset of parts.
+
+    rotation: 3x3 matrix describing object orientation.
+    translation: length-3 vector for object origin.
+    scale: length-3 vector describing object scale applied after rotation.
+    """
+    if not parts:
+        return None
+    rot = np.array(rotation)
+    trans = np.array(translation)
+    scale_vec = np.array(scale)
+    if scale_vec.shape != (3,):
+        scale_vec = np.array([scale_vec[0], scale_vec[1], scale_vec[2]])
+    rot_T = rot.transpose()
+    normalized_points = []
+    for part in parts:
+        try:
+            bbox = part.get_bound_box()
+        except Exception:
+            bbox = None
+        if bbox is None:
+            continue
+        bbox = np.array(bbox)
+        if bbox.size == 0:
+            continue
+        for corner in bbox:
+            world_corner = np.array(corner)
+            local = rot_T @ (world_corner - trans)
+            local = np.divide(local, scale_vec, out=np.zeros_like(local), where=scale_vec!=0)
+            normalized_points.append(local)
+    if not normalized_points:
+        return None
+    pts = np.stack(normalized_points, axis=0)
+    min_vals = pts.min(axis=0)
+    max_vals = pts.max(axis=0)
+    return _construct_world_bbox_from_extents(min_vals, max_vals, rot, trans, scale_vec)
+
+
+def _construct_world_bbox_from_extents(min_vals, max_vals, rotation, translation, scale_vec):
+    """Create 8 bounding-box corner coordinates in world space given extents in object-local space."""
+    min_x, min_y, min_z = min_vals
+    max_x, max_y, max_z = max_vals
+    local_points = [
+        [min_x, min_y, min_z],
+        [min_x, min_y, max_z],
+        [min_x, max_y, min_z],
+        [min_x, max_y, max_z],
+        [max_x, min_y, min_z],
+        [max_x, min_y, max_z],
+        [max_x, max_y, min_z],
+        [max_x, max_y, max_z],
+    ]
+    world_points = []
+    for point in local_points:
+        local = np.array(point) * scale_vec
+        world = rotation @ local + translation
+        world_points.append(world.tolist())
+    return world_points
+
+def pick_emissive_color(entry):
+    color_spec = entry.get("color")
+    color_list = entry.get("color_list")
+    def ensure_rgba(values):
+        vals = list(values)
+        if len(vals) >= 4:
+            return vals[:4]
+        while len(vals) < 3:
+            vals.append(0.0)
+        vals = vals[:3]
+        vals.append(entry.get("alpha", 1.0))
+        return vals
+
+    if isinstance(color_spec, (list, tuple)) and len(color_spec) >= 3:
+        return ensure_rgba(color_spec)
+    if isinstance(color_spec, str):
+        if color_spec.lower() == "random":
+            color_spec = None
+        else:
+            # Unrecognized string, fall back to random below
+            color_spec = None
+
+    if isinstance(color_list, list):
+        valid_choices = [c for c in color_list if isinstance(c, (list, tuple)) and len(c) >= 3]
+        if valid_choices:
+            choice = random.choice(valid_choices)
+            return ensure_rgba(choice)
+    return ensure_rgba([random.random(), random.random(), random.random()])
+
+def should_enable_emissive(entry):
+    status = entry.get("status", "on")
+    if isinstance(status, str):
+        normalized = status.strip().lower()
+    else:
+        normalized = "on"
+    if normalized == "on":
+        return True
+    if normalized == "off":
+        return False
+    if normalized == "random":
+        return bool(random.getrandbits(1))
+    return True
+
+def pick_emissive_intensity(entry):
+    value = entry.get("intensity", 5.0)
+    if isinstance(value, (list, tuple)) and len(value) >= 2:
+        try:
+            low = float(value[0])
+            high = float(value[1])
+        except (TypeError, ValueError):
+            low = high = 5.0
+        if low > high:
+            low, high = high, low
+        return random.uniform(low, high)
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 5.0
+
+
+def apply_object_properties(subparts, properties, class_name):
+    if not properties:
+        return
+    emissive_cfg = properties.get("emissive")
+    if emissive_cfg:
+        for entry in emissive_cfg:
+            apply_emissive_property(subparts, entry, class_name)
+    exclude_cfg = properties.get("exclude_parts")
+    if exclude_cfg:
+        apply_exclude_part_settings(subparts, exclude_cfg, class_name)
+
+def apply_emissive_property(subparts, entry, class_name):
+    if not should_enable_emissive(entry):
+        return
+    body = entry.get("body")
+    targets = []
+    if body:
+        body_lower = body.lower()
+        for obj in subparts:
+            name = obj.get_name() or ""
+            if body_lower in name.lower():
+                targets.append(obj)
+        if not targets:
+            key = (class_name.lower(), body_lower)
+            if key not in _missing_emissive_targets:
+                print(f"Warning: emissive body '{body}' not found in model '{class_name}'.")
+                _missing_emissive_targets.add(key)
+            return
+    else:
+        targets = subparts
+
+    color = pick_emissive_color(entry)           # RGBA list
+    strength = pick_emissive_intensity(entry)
+
+    for obj in targets:
+        # Try to reuse existing material if there is one
+        mats = obj.get_materials()
+        if mats:
+            mat = mats[0]
+        else:
+            # Create a new material and assign it
+            mat_name = f"emissive_{class_name}_{body or 'all'}"
+            mat = bp.material.create(mat_name)
+            obj.set_material(0, mat)
+
+        # Make it emissive with the chosen color
+        mat.make_emissive(emission_strength=strength, emission_color=color)
+        # Optional: if you want the base color of the non-emissive part to match as well:
+        # mat.set_principled_shader_value("Base Color", color)
 
 
 def rotated_rectangle_extents(w, h, angle):
@@ -177,9 +892,12 @@ def scale_to_original_shape(img, o_width, o_height):
     return cropped.resize((o_width, o_height))
 
 
-def get_cuboid_image_space(mesh, camera):
+def get_cuboid_image_space(mesh, camera, bbox_override=None):
     # object aligned bounding box coordinates in world coordinates
-    bbox = mesh.get_bound_box()
+    bbox_source = bbox_override if bbox_override is not None else mesh.get_bound_box()
+    bbox = np.array(bbox_source, dtype=float)
+    if bbox.ndim != 2 or bbox.shape[0] < 8 or bbox.shape[1] < 3:
+        raise ValueError("Invalid bounding box data for projection.")
     '''
     bbox is a list of the world-space coordinates of the corners of a
     blender object's oriented bounding box
@@ -241,7 +959,7 @@ def get_cuboid_image_space(mesh, camera):
     return np.array(cuboid, dtype=float).tolist()
 
 
-def write_json(outf, args, camera, objects, objects_data, seg_map):
+def write_json(outf, args, camera, objects, objects_data, seg_map, projected_cuboids=None):
     cam_xform = camera.get_camera_pose()
     eye = -cam_xform[0:3,3]
     at = -cam_xform[0:3,2]
@@ -290,7 +1008,10 @@ def write_json(outf, args, camera, objects, objects_data, seg_map):
 
         if num_pixels < args.min_pixels:
             continue
-        projected_keypoints = get_cuboid_image_space(oo, camera)
+        if projected_cuboids and projected_cuboids[ii]:
+            projected_keypoints = projected_cuboids[ii]
+        else:
+            projected_keypoints = get_cuboid_image_space(oo, camera)
 
         data['objects'].append({
             'class': objects_data[ii]['class'],
@@ -309,13 +1030,16 @@ def write_json(outf, args, camera, objects, objects_data, seg_map):
     return data
 
 
-def draw_cuboid_markers(objects, camera, im):
+def draw_cuboid_markers(objects, camera, im, projected_cuboids=None):
     colors = ['yellow', 'magenta', 'blue', 'red', 'green', 'orange', 'brown', 'cyan', 'white']
     R = 2 # radius
     # draw dots on image to label the cuiboid vertices
     draw = ImageDraw.Draw(im)
-    for oo in objects:
-        projected_keypoints = get_cuboid_image_space(oo, camera)
+    for idx, oo in enumerate(objects):
+        if projected_cuboids and projected_cuboids[idx]:
+            projected_keypoints = projected_cuboids[idx]
+        else:
+            projected_keypoints = get_cuboid_image_space(oo, camera)
         for idx, pp in enumerate(projected_keypoints):
             x = int(pp[0])
             y = int(pp[1])
@@ -325,21 +1049,19 @@ def draw_cuboid_markers(objects, camera, im):
 
 
 def randomize_background(path, width, height):
-    img = Image.open(path)
+    """Load a background image and scale it to cover the target size without additional transformations."""
+    img = Image.open(path).convert("RGB")
+    src_w, src_h = img.size
+    if src_w == 0 or src_h == 0:
+        return img.resize((width, height), Image.BICUBIC)
 
-    # Randomly rotate
-    angle = 45.0 - random.random()*90.0
-    img = crop_to_rotation(img, angle)
-    img = scale_to_original_shape(img, width, height)
+    scale = max(width / src_w, height / src_h)
+    new_size = (int(src_w * scale + 0.5), int(src_h * scale + 0.5))
+    img = img.resize(new_size, Image.BICUBIC)
 
-    # Randomly flip in horizontal and vertical directions
-    if random.random() > 0.5:
-        # flip horizontal
-        img = img.transpose(Image.FLIP_LEFT_RIGHT)
-    if random.random() > 0.5:
-        # flip vertical
-        img = img.transpose(Image.FLIP_TOP_BOTTOM)
-
+    left = max(0, (img.size[0] - width) // 2)
+    top = max(0, (img.size[1] - height) // 2)
+    img = img.crop((left, top, left + width, top + height))
     return img
 
 
@@ -353,15 +1075,37 @@ def set_world_background_hdr(filename, strength=1.0, rotation_euler=None):
     if rotation_euler is None:
         rotation_euler = [0.0, 0.0, 0.0]
 
-    nodes = bpy.context.scene.world.node_tree.nodes
-    links = bpy.context.scene.world.node_tree.links
+    scene = bpy.context.scene
+    if scene.world is None:
+        scene.world = bpy.data.worlds.new("World")
+    world = scene.world
+    if not world.use_nodes:
+        world.use_nodes = True
+    if world.node_tree is None:
+        world.use_nodes = True
+    nodes = world.node_tree.nodes
+    links = world.node_tree.links
+
+    # Ensure background and output nodes exist
+    background_node = None
+    output_node = None
+    for node in nodes:
+        if node.type == 'BACKGROUND' and background_node is None:
+            background_node = node
+        elif node.type == 'OUTPUT_WORLD' and output_node is None:
+            output_node = node
+    if background_node is None:
+        background_node = nodes.new(type="ShaderNodeBackground")
+    if output_node is None:
+        output_node = nodes.new(type="ShaderNodeOutputWorld")
+    if not any(link.to_node == output_node and link.from_node == background_node for link in links):
+        links.new(background_node.outputs["Background"], output_node.inputs["Surface"])
 
     # add a texture node and load the image and link it
     texture_node = nodes.new(type="ShaderNodeTexEnvironment")
     texture_node.image = bpy.data.images.load(filename, check_existing=True)
 
     # get the background node of the world shader and link the new texture node
-    background_node = Utility.get_the_one_node_with_type(nodes, "Background")
     links.new(texture_node.outputs["Color"], background_node.inputs["Color"])
 
     # Set the brightness
@@ -377,30 +1121,203 @@ def set_world_background_hdr(filename, strength=1.0, rotation_euler=None):
 
     mapping_node.inputs["Rotation"].default_value = rotation_euler
 
+def pick_scene_rotation(scene_rotation_cfg):
+    if not scene_rotation_cfg:
+        return [
+            random.random() * 0.2 - 0.1,
+            random.random() * 0.2 - 0.1,
+            random.random() * 0.2 - 0.1,
+        ]
+    rotation = []
+    for axis in ("pitch", "yaw", "roll"):
+        lo, hi = scene_rotation_cfg.get(axis, (0.0, 0.0))
+        rotation.append(random.uniform(lo, hi))
+    return rotation
+
 
 def main(args):
+    cycles = max(1, int(getattr(args, "restart_cycles", 1)))
+    frame_offset = 0
+    for cycle_idx in range(cycles):
+        frame_offset = run_generation_cycle(args, cycle_idx, cycles, frame_offset)
+
+
+def run_generation_cycle(args, cycle_index=0, total_cycles=1, frame_offset=0):
     ## Segmentation values
     SEG_DISTRACT = 0
 
     ## All units used are in centimeters
+    base_scale_vec = np.array([args.scale, args.scale, args.scale], dtype=float)
 
     # Make output directories
     out_directory = os.path.join(args.outf, str(args.run_id))
     os.makedirs(out_directory, exist_ok=True)
 
+    sence_config_data = load_sence_config_data(args.rotation_config)
+    rotation_config = load_rotation_config(args.rotation_config, config_data=sence_config_data)
+    hdri_background_config = load_hdri_background_config(args.rotation_config, config_data=sence_config_data)
+    background_overlay_config = load_background_overlay_config(args.rotation_config, config_data=sence_config_data)
+    scene_rotation_config = load_scene_rotation_config(args.rotation_config, config_data=sence_config_data)
+    object_properties_config = load_object_properties_config(args.object_properties)
+
+    if cycle_index == 0:
+        bp.init()
+    else:
+        print(f"Restarting BlenderProc for cycle {cycle_index + 1}/{total_cycles}", flush=True)
+        bp.clean_up(clean_up_camera=True)
+
     # Construct list of background images
-    image_types = ('*.jpg', '*.jpeg', '*.JPG', '*.JPEG', '*.png', '*.PNG', '*.hdr', '*.HDR')
+    image_types = (
+        '*.jpg', '*.jpeg', '*.JPG', '*.JPEG',
+        '*.png', '*.PNG',
+        '*.hdr', '*.HDR',
+        '*.exr', '*.EXR'
+    )
     backdrop_images = []
+    background_idx = 0  # index for cycling through backgrounds
+
+    hdr_backdrops = []
     if args.backgrounds_folder is not None:
         for ext in image_types:
             backdrop_images.extend(glob.glob(os.path.join(args.backgrounds_folder,
                                                           os.path.join('**', ext)),
                                              recursive=True))
+
+        # Sort for deterministic order (optional but nice for reproducibility)
+        backdrop_images.sort()
+
         if len(backdrop_images) == 0:
             print(f"No images found in backgrounds directory '{args.backgrounds_folder}'")
         else:
-            print(f"{len(backdrop_images)} images found in backgrounds directory "
-                  f"'{args.backgrounds_folder}'")
+            num_hdr = sum(
+                1 for p in backdrop_images
+                if os.path.splitext(p)[1].lower() in (".hdr", ".exr")
+            )
+            num_ldr = len(backdrop_images) - num_hdr
+            print(
+                f"{len(backdrop_images)} background images found in '{args.backgrounds_folder}' "
+                f"({num_hdr} HDR / {num_ldr} non-HDR). "
+                "Backgrounds cycle sequentially by default; HDR-specific settings in sence_config can override this."
+            )
+        hdr_backdrops = [
+            p for p in backdrop_images
+            if os.path.splitext(p)[1].lower() in (".hdr", ".exr")
+        ]
+
+    hdri_runtime = None
+    if hdri_background_config:
+        if not hdr_backdrops:
+            print("HDRI backgrounds enabled in config but no HDR files were found; ignoring that setting.")
+        else:
+            selected_paths = list(hdr_backdrops)
+            if hdri_background_config["selection_method"] == "iterate":
+                desired_count = hdri_background_config.get("count")
+                if desired_count not in (None, "all"):
+                    try:
+                        take = int(desired_count)
+                    except (TypeError, ValueError):
+                        take = None
+                    if take is not None and take > 0:
+                        take = min(take, len(selected_paths))
+                        if take > 0:
+                            selected_paths = selected_paths[:take]
+            if not selected_paths:
+                selected_paths = list(hdr_backdrops)
+            hdri_runtime = {
+                "paths": selected_paths,
+                "method": hdri_background_config["selection_method"],
+                "strength_range": hdri_background_config["strength_range"],
+                "random_selection": None
+            }
+            if hdri_runtime["method"] == "random":
+                total_hdr = len(hdr_backdrops)
+                desired_count = hdri_background_config.get("count")
+                if desired_count is None or desired_count == "all":
+                    sample_size = total_hdr
+                else:
+                    try:
+                        sample_size = int(desired_count)
+                    except (TypeError, ValueError):
+                        sample_size = 1
+                sample_size = max(1, min(sample_size, total_hdr))
+                hdri_runtime["random_selection"] = random.sample(hdr_backdrops, sample_size)
+
+    fallback_overlay_paths = [
+        p for p in backdrop_images
+        if os.path.splitext(p)[1].lower() not in HDR_FILE_EXTENSIONS
+    ]
+    fallback_overlay_idx = 0
+
+    background_overlay_runtime = None
+    if background_overlay_config:
+        dataset_dir = background_overlay_config["folder"]
+        overlay_paths = []
+        if dataset_dir.is_dir():
+            for candidate in dataset_dir.rglob("*"):
+                if candidate.is_file() and candidate.suffix.lower() in LDR_IMAGE_EXTENSIONS:
+                    overlay_paths.append(str(candidate))
+            overlay_paths.sort()
+            if overlay_paths:
+                requested_count = background_overlay_config["count"]
+                total_available = len(overlay_paths)
+                if requested_count is None or requested_count < 1 or requested_count > total_available:
+                    requested_count = total_available
+                method = background_overlay_config["selection_method"]
+                if method == "iterate":
+                    background_overlay_runtime = {
+                        "paths": overlay_paths,
+                        "method": method,
+                        "chunk_size": requested_count,
+                        "index": 0
+                    }
+                else:
+                    background_overlay_runtime = {
+                        "paths": overlay_paths,
+                        "method": "random",
+                        "random_count": requested_count
+                    }
+            else:
+                print(f"Backgrounds config enabled but no images found under '{dataset_dir}'.")
+        else:
+            print(f"Backgrounds config enabled but folder '{dataset_dir}' does not exist.")
+
+    frames_per_cycle = max(1, int(args.frames_per_cycle))
+    if hdri_runtime:
+        if hdri_runtime["method"] == "iterate":
+            hdr_multiplier = len(hdri_runtime["paths"])
+        else:
+            hdr_multiplier = len(hdri_runtime["random_selection"]) if hdri_runtime["random_selection"] else 1
+    else:
+        hdr_multiplier = 1
+    if background_overlay_runtime:
+        if background_overlay_runtime["method"] == "iterate":
+            background_multiplier = background_overlay_runtime["chunk_size"]
+        else:
+            background_multiplier = background_overlay_runtime["random_count"]
+    else:
+        background_multiplier = 1
+    cycle_frame_target = frames_per_cycle * hdr_multiplier * background_multiplier
+    frame_counter = frame_offset
+    total_frames = frame_offset + cycle_frame_target
+
+    def next_mixed_backdrop():
+        nonlocal background_idx
+        if not backdrop_images:
+            return (None, None)
+        path = backdrop_images[background_idx]
+        background_idx = (background_idx + 1) % len(backdrop_images)
+        ext = os.path.splitext(path)[1].lower()
+        if ext in HDR_FILE_EXTENSIONS:
+            return (path, None)
+        return (None, path)
+
+    def next_fallback_overlay():
+        nonlocal fallback_overlay_idx
+        if not fallback_overlay_paths:
+            return None
+        path = fallback_overlay_paths[fallback_overlay_idx]
+        fallback_overlay_idx = (fallback_overlay_idx + 1) % len(fallback_overlay_paths)
+        return path
 
     # Construct list of object models
     object_models = []
@@ -418,9 +1335,6 @@ def main(args):
     # Construct list of distractors
     distractor_objs = glob.glob(args.distractors_folder + "**/model.obj", recursive=True)
     print(f"{len(distractor_objs)} distractor objects found.")
-
-    # Set up blenderproc
-    bp.init()
 
     # Set the camera to be in front of the object
     cam_pose = bp.math.build_transformation_mat([0, -25, 0], [np.pi / 2, 0, 0])
@@ -451,24 +1365,66 @@ def main(args):
 
 
     # Renderer setup
-    bp.renderer.set_output_format('PNG')
+    bp.renderer.set_output_format('PNG', enable_transparency=True)
     bp.renderer.set_render_devices(desired_gpu_ids=[0])
 
 
     # Create objects
     objects = []
+    object_subparts = []
+    object_property_settings = []
+    object_bbox_overrides = []
     objects_data = []
     for idx in range(args.nb_objects):
         model_path =  object_models[random.randint(0, len(object_models) - 1)]
-        obj = bp.loader.load_obj(model_path)[0]
+        loaded_objs = bp.loader.load_obj(
+            model_path,
+            use_split_groups=True,
+            use_split_objects=True
+        )
+        obj_class = args.object_class
+        if len(loaded_objs) == 0:
+            print(f"Warning: no meshes loaded from {model_path}")
+            continue
+        print(f"Loaded object '{obj_class}' with parts:")
+        for part in loaded_objs:
+            try:
+                print(f"  - {part.get_name()}")
+            except Exception:
+                print("  - (unnamed part)")
+        obj = loaded_objs[0]
         obj.set_cp("category_id", 1+idx)
         objects.append(obj)
-        obj_class = args.object_class
+        object_subparts.append(loaded_objs)
         obj_name = obj_class + "_" + str(idx).zfill(3)
         objects_data.append({'class': obj_class,
                             'name': obj_name,
                             'id':1+idx
                             })
+        props = get_object_properties(object_properties_config, obj_class)
+        object_property_settings.append(props)
+        object_bbox_overrides.append(prepare_bbox_part_overrides(loaded_objs, props, obj_class))
+        
+    # Decide if we need glare based on object properties (but don't enable yet)
+    glare_settings = None
+    for settings in object_property_settings:
+        if not settings:
+            continue
+        emissive = settings.get("emissive", [])
+        for entry in emissive:
+            glare_entry = entry.get("glare")
+            if isinstance(glare_entry, dict) and glare_entry.get("enabled"):
+                glare_settings = glare_entry
+                break
+        if glare_settings:
+            break
+
+    # Track per-object transforms for custom bounding boxes
+    object_transform_states = [{
+        "rotation": np.eye(3),
+        "translation": np.zeros(3),
+        "scale": base_scale_vec.copy()
+    } for _ in objects]
 
     # Create distractor(s)
     distractors = []
@@ -480,87 +1436,139 @@ def main(args):
             distractors.append(distractor)
             print(f"loaded {distractor_fn}")
 
-    for frame in range(args.nb_frames):
-        # Randomize light
-        #light.set_location([10-random.random()*20, 10-random.random()*20,
-        #                    150+random.random()*100])
+    if hdri_runtime:
+        if hdri_runtime["method"] == "random":
+            hdr_sequence = hdri_runtime["random_selection"] or []
+        else:
+            hdr_sequence = hdri_runtime["paths"]
+    else:
+        hdr_sequence = [None]
 
-        # Place object(s)
-        for idx, oo in enumerate(objects):
-            # Set a random pose
-            xform = np.eye(4)
-            xform[0:3,3] = random_object_position(near=20, far=100)
-            xform[0:3,0:3] = random_rotation_matrix()
-            oo.set_local2world_mat(xform)
-
-            # 'location' and 'quaternion_xyzw' describe the position and orientation of the
-            # object in the camera coordinate system
-            xform_in_cam = np.linalg.inv(bp.camera.get_camera_pose()) @ xform
-            objects_data[idx]['location'] = xform_in_cam[0:3,3].tolist()
-            tmp_wxyz = Quaternion(matrix=xform_in_cam[0:3,0:3]).elements  # [scalar, x, y, z]
-            q_xyzw = [tmp_wxyz[1], tmp_wxyz[2], tmp_wxyz[3], tmp_wxyz[0]] # [x, y, z, scalar]
-            objects_data[idx]['quaternion_xyzw'] = q_xyzw
-
-            # Scale 3D model to cm
-            oo.set_scale([args.scale, args.scale, args.scale])
-
-        # Place distractors
-        for dd in distractors:
-            xform = np.eye(4)
-            xform[0:3,3] = point_in_frustrum(bp.camera, near=5.0, far=100.)
-            xform[0:3,0:3] = random_rotation_matrix()
-            dd.set_local2world_mat(xform)
-            dd.set_scale([args.distractor_scale, args.distractor_scale, args.distractor_scale])
-
-        # Render the scene
-        background_path = None
-        if args.backgrounds_folder:
-            background_path = backdrop_images[random.randint(0, len(backdrop_images) - 1)]
-            if os.path.splitext(background_path)[1].lower() == ".hdr":
-                strength = random.random()+0.5
-                rotation = [random.random()*0.2-0.1, random.random()*0.2-0.1,
-                            random.random()*0.2-0.1]
-                set_world_background_hdr(background_path, strength, rotation)
+    for hdr_path in hdr_sequence:
+        overlay_candidates = select_backgrounds_for_hdr(background_overlay_runtime) if background_overlay_runtime else None
+        for _ in range(frames_per_cycle):
+            env_path = hdr_path
+            fallback_overlay = None
+            if hdri_runtime is None:
+                fallback_env, fallback_overlay = next_mixed_backdrop()
+                if env_path is None:
+                    env_path = fallback_env
             else:
-                bp.renderer.set_output_format(enable_transparency=True)
+                fallback_overlay = next_fallback_overlay()
 
-        # redirect blenderproc output to log file
-        logfile = '/tmp/blender_render.log'
-        open(logfile, 'a').close()
-        old = os.dup(sys.stdout.fileno())
-        sys.stdout.flush()
-        os.close(sys.stdout.fileno())
-        fd = os.open(logfile, os.O_WRONLY)
+            if background_overlay_runtime:
+                overlays_to_apply = overlay_candidates or [fallback_overlay]
+            else:
+                overlays_to_apply = [fallback_overlay]
 
-        segs = bp.renderer.render_segmap()
-        data = bp.renderer.render()
+            overlays_to_apply = overlays_to_apply or [None]
+            should_overlay_background = any(bool(path) for path in overlays_to_apply)
+            # Use transparent film only when we plan to composite a 2D background later.
+            bpy.context.scene.render.film_transparent = should_overlay_background
 
-        # disable output redirection
-        os.close(fd)
-        os.dup(old)
-        os.close(old)
+            # Place object(s)
+            for idx, oo in enumerate(objects):
+                xform = np.eye(4)
+                xform[0:3, 3] = random_object_position(near=20, far=100)
+                rot_ranges = get_rotation_ranges(rotation_config, objects_data[idx]['class'], object_property_settings[idx])
+                xform[0:3, 0:3] = random_rotation_matrix(rot_ranges)
+                object_transform_states[idx]["rotation"] = xform[0:3, 0:3].copy()
+                object_transform_states[idx]["translation"] = xform[0:3, 3].copy()
+                object_transform_states[idx]["scale"] = base_scale_vec.copy()
 
-        im = Image.fromarray(data['colors'][0])
+                for part in object_subparts[idx]:
+                    part.set_local2world_mat(xform)
+                    part.set_scale([args.scale, args.scale, args.scale])
 
-        if args.backgrounds_folder:
-            if os.path.splitext(background_path)[1].lower() != ".hdr":
-                # We have an ordinary image. We randomize its rotation and crop
-                # and paste it in as a background
-                background = randomize_background(background_path, args.width, args.height)
-                background = background.convert('RGB') # some images may be B&W
-                # Pasting the current image on the selected background
-                background.paste(im, mask=im.convert('RGBA'))
-                im = background
+                xform_in_cam = np.linalg.inv(bp.camera.get_camera_pose()) @ xform
+                objects_data[idx]['location'] = xform_in_cam[0:3, 3].tolist()
+                tmp_wxyz = Quaternion(matrix=xform_in_cam[0:3, 0:3]).elements
+                q_xyzw = [tmp_wxyz[1], tmp_wxyz[2], tmp_wxyz[3], tmp_wxyz[0]]
+                objects_data[idx]['quaternion_xyzw'] = q_xyzw
 
-        if args.debug:
-            im = draw_cuboid_markers(objects, bp.camera, im)
+            for idx in range(len(objects)):
+                apply_object_properties(object_subparts[idx], object_property_settings[idx], objects_data[idx]['class'])
 
-        filename = os.path.join(out_directory, str(frame).zfill(6) + ".png")
-        im.save(filename)
+            for dd in distractors:
+                xform = np.eye(4)
+                xform[0:3,3] = point_in_frustrum(bp.camera, near=5.0, far=100.)
+                xform[0:3,0:3] = random_rotation_matrix()
+                dd.set_local2world_mat(xform)
+                dd.set_scale([args.distractor_scale, args.distractor_scale, args.distractor_scale])
 
-        ## Export JSON file
-        filename = os.path.join(out_directory, str(frame).zfill(6) + ".json")
-        write_json(filename, args, bp.camera, objects, objects_data, segs['class_segmaps'][0])
+            # Configure HDR environment if available
+            env_is_hdr = env_path and os.path.splitext(env_path)[1].lower() in HDR_FILE_EXTENSIONS
+            if env_is_hdr:
+                if hdri_runtime and env_path in hdri_runtime["paths"]:
+                    strength_range = hdri_runtime["strength_range"]
+                    method_label = hdri_runtime["method"]
+                else:
+                    strength_range = (0.5, 1.5)
+                    method_label = "sequential"
+                strength = random.uniform(strength_range[0], strength_range[1])
+                rotation = pick_scene_rotation(scene_rotation_config)
+                set_world_background_hdr(env_path, strength, rotation)
+
+            # redirect blenderproc output to log file
+            logfile = '/tmp/blender_render.log'
+            open(logfile, 'a').close()
+            old = os.dup(sys.stdout.fileno())
+            sys.stdout.flush()
+            os.close(sys.stdout.fileno())
+            fd = os.open(logfile, os.O_WRONLY)
+
+            setup_compositor_glare({"enabled": False})
+            segs = bp.renderer.render_segmap()
+            captured_segmaps = segs['class_segmaps'][0]
+
+            setup_compositor_glare(glare_settings)
+            data = bp.renderer.render()
+
+            os.close(fd)
+            os.dup(old)
+            os.close(old)
+
+            base_image = Image.fromarray(data['colors'][0])
+            projected_cuboids = []
+            for obj_idx, obj in enumerate(objects):
+                bbox_override_pts = None
+                overrides = object_bbox_overrides[obj_idx]
+                if overrides is not None:
+                    transform = object_transform_states[obj_idx]
+                    bbox_override_pts = compute_bbox_override_points(
+                        overrides,
+                        transform["rotation"],
+                        transform["translation"],
+                        transform["scale"],
+                    )
+                projected = get_cuboid_image_space(obj, bp.camera, bbox_override=bbox_override_pts)
+                projected_cuboids.append(projected)
+
+            for overlay_path in overlays_to_apply:
+                frame_id = frame_counter
+                frame_counter += 1
+                print(
+                    f"Run {args.run_id} cycle {cycle_index + 1}/{total_cycles}: "
+                    f"{frame_counter}/{total_frames}",
+                    flush=True
+                )
+
+                im = base_image.copy()
+
+                if overlay_path:
+                    background = randomize_background(overlay_path, args.width, args.height)
+                    background = background.convert('RGB')
+                    background.paste(im, mask=im.convert('RGBA'))
+                    im = background
+
+                if args.debug:
+                    im = draw_cuboid_markers(objects, bp.camera, im, projected_cuboids)
+
+                file_base = os.path.join(out_directory, f"{frame_id:06d}")
+                im.save(file_base + ".png")
+                write_json(file_base + ".json", args, bp.camera, objects, objects_data, captured_segmaps, projected_cuboids)
+
+    return frame_counter
 
 
 if __name__ == "__main__":
@@ -581,6 +1589,12 @@ if __name__ == "__main__":
         type=int,
         help='Output files will be put in a subdirectory of this name. This parameter should '
         'not be set by the user'
+    )
+    parser.add_argument(
+        '--restart_cycles',
+        default=1,
+        type=int,
+        help='Number of times to fully regenerate the scene. Each cycle cleans the Blender state before rendering.'
     )
     parser.add_argument(
         '--width',
@@ -651,10 +1665,12 @@ if __name__ == "__main__":
              'e.g if the object scale is meters -> scale=100; if it is in cm -> scale=1'
     )
     parser.add_argument(
-        '--nb_frames',
-        type = int,
+        '--frames_per_cycle', '--nb_frames',
+        dest='frames_per_cycle',
+        type=int,
         default=2000,
-        help = "how many total frames to generate"
+        help="How many frames to render per background/HDR cycle (alias --nb_frames). "
+             "When HDRI selection_method='iterate', total frames = frames_per_cycle * number_of_HDRs."
     )
     parser.add_argument(
         '--min_pixels',
@@ -673,6 +1689,18 @@ if __name__ == "__main__":
         default=False,
         help="Render the cuboid corners as small spheres. Only for debugging purposes;"
         "do not use for training!"
+    )
+    parser.add_argument(
+        '--rotation_config',
+        default=None,
+        help="Path to a JSON file specifying per-class rotation limits (degrees). "
+             "If omitted, the script looks for 'sence_config.json' under the repo 'config' directory."
+    )
+    parser.add_argument(
+        '--object_properties',
+        default=None,
+        help="Path to JSON describing per-object properties (e.g., emissive parts). "
+             "Defaults to 'object_properties.json' inside the repo-wide 'config' directory."
     )
 
     opt = parser.parse_args()

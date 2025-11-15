@@ -16,10 +16,14 @@ If you run into troubles, please consult the [project's own GitHub page](https:/
 
 ### Usage example:
 
-Run the BlenderProc script in five parallel jobs, each generating 1000 frames. Each frame will have six instances of the object and ten randomly chosen distractor objects:
+Run the BlenderProc script in five parallel jobs, each generating 1000 frames per run. Each frame will have six instances of the object and ten randomly chosen distractor objects:
 ```
-./run_blenderproc_datagen.py --nb_runs 5 --nb_frames 1000 --path_single_obj ../models/Ketchup/google_16k/textured.obj --nb_objects 6 --object_class ketchup --distractors_folder ~/data/google_scanned_models/ --nb_distractors 10 --backgrounds_folder ../dome_hdri_haven/
+./run_blenderproc_datagen.py --nb_runs 5 --frames_per_cycle 1000 --path_single_obj ../models/Ketchup/google_16k/textured.obj --nb_objects 6 --object_class ketchup --distractors_folder ~/data/google_scanned_models/ --nb_distractors 10 --backgrounds_folder ../dome_hdri_haven/
 ```
+
+If `config/sence_config.json` enables `HDRI_backgrounds`, `selection_method: "random"` samples `count` unique HDRs per run (default/all), while `"iterate"` renders every HDR deterministically. The HDR contribution to total frames is `frames_per_cycle * (# of HDRs used in the run)`.
+
+Similarly, a `backgrounds` block in `sence_config.json` lets you control the 2D backgrounds composited behind each render. Images default to `data/background_images` (override with the `folder` field). `selection_method: "random"` samples `count` unique backgrounds per HDR (or every image if `count`/`all` is omitted); `iterate`/`all` pairs each HDR with `count` distinct backgrounds in sorted order.
 
 Parameters of the top-level script can be shown by running
 ```

@@ -3,7 +3,7 @@
 """
 Example usage:
 
- python -m torch.distributed.launch --nproc_per_node=1 train.py --data ../sample_data/ --object cracker
+ torchrun --nproc_per_node=1 train.py --data ../sample_data/ --object cracker
 """
 
 
@@ -29,7 +29,12 @@ import torchvision.transforms as transforms
 from tensorboardX import SummaryWriter
 
 import sys
-sys.path.insert(1, '../common')
+
+ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+COMMON_DIR = os.path.join(ROOT_DIR, "common")
+if COMMON_DIR not in sys.path:
+    sys.path.insert(1, COMMON_DIR)
+
 from models import *
 from utils import *
 
@@ -41,6 +46,7 @@ def _runnetwork(net, optimizer, local_rank, epoch, train_loader, writer=None):
     loss_avg_to_log["loss_affinities"] = []
     loss_avg_to_log["loss_belief"] = []
     loss_avg_to_log["loss_class"] = []
+    samples_seen = 0
     for batch_idx, targets in enumerate(train_loader):
         optimizer.zero_grad()
 
@@ -120,17 +126,13 @@ def _runnetwork(net, optimizer, local_rank, epoch, train_loader, writer=None):
         loss_avg_to_log["loss_affinities"].append(loss_affinities.item())
         loss_avg_to_log["loss_belief"].append(loss_belief.item())
 
-        if batch_idx % opt.loginterval == 0:
-            print(
-                "Train Epoch: {} [{}/{} ({:.0f}%)] \tLoss: {:.15f} \tLocal Rank: {}".format(
-                    epoch,
-                    batch_idx * len(data),
-                    len(train_loader.dataset),
-                    100.0 * batch_idx / len(train_loader),
-                    loss.item(),
-                    local_rank,
-                )
-            )
+        samples_seen += len(data)
+        processed = min(samples_seen, len(train_loader.dataset))
+        percent = 100.0 * processed / len(train_loader.dataset)
+        print(
+            f"Train Epoch: {epoch} [{processed}/{len(train_loader.dataset)} ({percent:.0f}%)] "
+            f"\tLoss: {loss.item():.15f} \tLocal Rank: {local_rank}"
+        )
 
     # log the loss values
     if writer is not None and local_rank == 0:
@@ -154,7 +156,12 @@ def main(opt):
     torch.autograd.gradcheck = False
     torch.backends.cudnn.benchmark = True
 
-    local_rank = opt.local_rank
+    if "LOCAL_RANK" in os.environ:
+        local_rank = int(os.environ["LOCAL_RANK"])
+    elif "SLURM_LOCALID" in os.environ:
+        local_rank = int(os.environ["SLURM_LOCALID"])
+    else:
+        local_rank = getattr(opt, "local_rank", 0)
 
     # Validate Arguments
     if opt.use_s3 and (opt.train_buckets is None or opt.endpoint is None):
@@ -255,33 +262,37 @@ def main(opt):
             start_epoch = 1
         print(f"Starting at epoch {start_epoch}")
 
-    net.train()
-    for epoch in range(start_epoch, opt.epochs + 1):
-        _runnetwork(net, optimizer, local_rank, epoch, training_data, writer)
+    try:
+        net.train()
+        for epoch in range(start_epoch, opt.epochs + 1):
+            _runnetwork(net, optimizer, local_rank, epoch, training_data, writer)
 
-        try:
-            if local_rank == 0 and epoch > 0 and epoch % opt.save_every == 0:
-                out_fn = f"{opt.outf}/net_{opt.namefile}_{str(epoch).zfill(4)}.pth"
-                torch.save(net.state_dict(), out_fn)
+            try:
+                if local_rank == 0 and epoch > 0 and epoch % opt.save_every == 0:
+                    out_fn = f"{opt.outf}/net_{opt.namefile}_{str(epoch).zfill(4)}.pth"
+                    torch.save(net.state_dict(), out_fn)
 
-                # Clean up old checkpoints if we're limiting the number saved
-                if ckpt_q is not None:
-                    if ckpt_q.full():
-                        to_del = ckpt_q.get()
-                        os.remove(to_del)
-                    ckpt_q.put(out_fn)
+                    # Clean up old checkpoints if we're limiting the number saved
+                    if ckpt_q is not None:
+                        if ckpt_q.full():
+                            to_del = ckpt_q.get()
+                            os.remove(to_del)
+                        ckpt_q.put(out_fn)
 
-        except Exception as e:
-            print(f"Encountered Exception: {e}")
+            except Exception as e:
+                print(f"Encountered Exception: {e}")
 
-    if local_rank == 0:
-        torch.save(
-            net.state_dict(),
-            f"{opt.outf}/final_net_{opt.namefile}_{str(epoch).zfill(4)}.pth"
-        )
+        if local_rank == 0:
+            torch.save(
+                net.state_dict(),
+                f"{opt.outf}/final_net_{opt.namefile}_{str(epoch).zfill(4)}.pth"
+            )
 
-    print("end:", datetime.datetime.now().strftime("%m/%d/%Y, %H:%M:%S"))
-    print("Total time taken: ", str(datetime.datetime.now() - start_time).split(".")[0])
+        print("end:", datetime.datetime.now().strftime("%m/%d/%Y, %H:%M:%S"))
+        print("Total time taken: ", str(datetime.datetime.now() - start_time).split(".")[0])
+    finally:
+        if torch.distributed.is_initialized():
+            torch.distributed.destroy_process_group()
     return
 
 
@@ -409,12 +420,6 @@ if __name__ == "__main__":
         "--sigma",
         default=4,
         help="keypoint creation sigma")
-    parser.add_argument(
-        "--local-rank",
-        type=int,
-        default=0
-    )
-
     parser.add_argument("--save", action="store_true", help="save a batch and quit")
     opt = parser.parse_args(remaining_argv)
 

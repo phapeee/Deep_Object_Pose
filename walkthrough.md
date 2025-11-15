@@ -27,10 +27,10 @@ structure:
 We will use the BlenderProc data generation utilities.  In the `data_generation/blenderproc_data_gen` directory, run the following command:
 
 ```
-./run_blenderproc_datagen.py --nb_runs 10 --nb_frames 50000 --path_single_obj ~/data/models/Ketchup/google_16k/textured.obj --nb_objects 1 --object_class Ketchup --distractors_folder ~/data/google_scanned_models/ --nb_distractors 10 --backgrounds_folder ~/data/dome_hdri_haven/ --outf ~/data/KetchupData
+./run_blenderproc_datagen.py --nb_runs 10 --frames_per_cycle 50000 --path_single_obj ~/data/models/Ketchup/google_16k/textured.obj --nb_objects 1 --object_class Ketchup --distractors_folder ~/data/google_scanned_models/ --nb_distractors 10 --backgrounds_folder ~/data/dome_hdri_haven/ --outf ~/data/KetchupData
 ```
 
-This will create ten subdirectories under the `~/data/KetchupData` directory, each containing 5000 images (`nb_images` divided by `nb_runs`).  For Blender efficiency reasons, the distractors are only changed from run to run. That is, we will have 10 different selections of distractors in our 50,000 images.  If you want 
+This will create ten subdirectories under the `~/data/KetchupData` directory, each containing roughly `frames_per_cycle` images (multiplied by any HDR/background iteration factors).  Total output frames equal `nb_runs × frames_per_cycle`. For Blender efficiency reasons, the distractors are only changed from run to run. That is, we will have 10 different selections of distractors in our rendered images.  If you want 
 a greater selection of distractors, increase the `nb_runs` parameter.
 
 ## Training
@@ -38,7 +38,7 @@ a greater selection of distractors, increase the `nb_runs` parameter.
 Assuming your machine has *N* GPUs, run the following command:
 
 ```
-python -m torch.distributed.launch --nproc_per_node=N ./train.py --data  ~/data/KetchupData --object Ketchup --epochs 2000 --save_every 100
+torchrun --nproc_per_node=N ./train.py --data  ~/data/KetchupData --object Ketchup --epochs 2000 --save_every 100
 ```
 
 This command will train DOPE for 2000 epochs, saving a checkpoint every 100 epochs.
@@ -49,7 +49,7 @@ When training is finished, you will have several saved checkpoints including the
 
 Generate a small number of new images in the same distribution as your training images. We will use these for inference testing and evaluation.
 ```
-./run_blenderproc_datagen.py --nb_runs 2 --nb_frames 20 --path_single_obj ~/data/models/Ketchup/google_16k/textured.obj --nb_objects 1 --distractors_folder ~/data/google_scanned_models/ --nb_distractors 10 --backgrounds_folder ~/data/dome_hdri_haven/ --outf ~/data/KetchupTest
+./run_blenderproc_datagen.py --nb_runs 2 --frames_per_cycle 20 --path_single_obj ~/data/models/Ketchup/google_16k/textured.obj --nb_objects 1 --distractors_folder ~/data/google_scanned_models/ --nb_distractors 10 --backgrounds_folder ~/data/dome_hdri_haven/ --outf ~/data/KetchupTest
 ```
 For convenience, we have uploaded 20 test images and JSON files to the  [Google Drive](https://drive.google.com/drive/folders/1zq4yJUj8lTn56bWdOMnkCr1Wmj0dq-GL)
  location mentioned above.
@@ -57,7 +57,7 @@ For convenience, we have uploaded 20 test images and JSON files to the  [Google 
 
 Inside the `inference` directory, run the following command:
 ```
-python ./inference.py --camera ../config/blenderproc_camera_info_example.yaml --object Ketchup --parallel --weights final_net_epoch_2000.pth --data ~/data/KetchupTest/
+python ./inference.py --config_dir ../config --object Ketchup --parallel --weights final_net_epoch_2000.pth --data ~/data/KetchupTest/
 ```
 
 The inference output will be in the `output` directory. Using our provided `final_net_epoch_2000.pth` and our provided test images, DOPE finds the object of interest in 13 out of 20 images.

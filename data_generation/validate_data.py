@@ -3,10 +3,16 @@
 import json
 import numpy as np
 import os
+from pathlib import Path
 from PIL import Image, ImageDraw
 from pyquaternion import Quaternion
 import sys
-sys.path.append("../common/")
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+COMMON_DIR = REPO_ROOT / "common"
+if str(COMMON_DIR) not in sys.path:
+    sys.path.append(str(COMMON_DIR))
+
 from cuboid import CuboidVertexType
 
 def main(json_files):
