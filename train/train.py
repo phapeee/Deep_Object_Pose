@@ -8,6 +8,7 @@ Example usage:
 
 
 import argparse
+import copy
 import datetime
 import json
 import os
@@ -44,6 +45,10 @@ from utils import *
 
 DEFAULT_KEYPOINT_ACCURACY_TOLERANCE = 5.0
 DEFAULT_MANIFEST_FILENAME = "training_manifest.json"
+
+class _AutoBatchRestart(Exception):
+    def __init__(self, batch_size):
+        self.batch_size = batch_size
 
 try:
     from validate_training_data import (
@@ -195,14 +200,14 @@ def _reset_peak_memory_stats(device):
 
 
 def _get_free_gpu_memory(device):
-    # if hasattr(torch.cuda, "mem_get_info"):
-    #     free_bytes, total_bytes = torch.cuda.mem_get_info(device)
-    # else:
-    props = torch.cuda.get_device_properties(device)
-    total_bytes = props.total_memory
-    reserved = torch.cuda.memory_reserved(device)
-    allocated = torch.cuda.memory_allocated(device)
-    free_bytes = total_bytes - max(reserved, allocated)
+    if hasattr(torch.cuda, "mem_get_info"):
+        free_bytes, total_bytes = torch.cuda.mem_get_info(device)
+    else:
+        props = torch.cuda.get_device_properties(device)
+        total_bytes = props.total_memory
+        reserved = torch.cuda.memory_reserved(device)
+        allocated = torch.cuda.memory_allocated(device)
+        free_bytes = total_bytes - max(reserved, allocated)
     return free_bytes, total_bytes
 
 
@@ -250,6 +255,8 @@ def _build_training_loader(dataset, batch_size, workers, controller=None):
 def _maybe_update_auto_batch(auto_ctx, local_rank, force=False):
     if not auto_ctx:
         return
+    if auto_ctx.get("auto_disabled"):
+        return
     cooldown = auto_ctx.get("cooldown_counter", 0)
     if cooldown > 0 and not force:
         auto_ctx["cooldown_counter"] = cooldown - 1
@@ -258,13 +265,23 @@ def _maybe_update_auto_batch(auto_ctx, local_rank, force=False):
     device = auto_ctx["device"]
     current_size = controller.get()
     torch.cuda.synchronize(device)
-    sample = torch.cuda.memory_allocated(device)
+    sample = max(
+        torch.cuda.memory_allocated(device),
+        torch.cuda.memory_reserved(device),
+    )
+    if auto_ctx.get("debug_samples"):
+        print(f"[auto-batch] VRAM sample: {sample / (1024 ** 3):.2f} GB (batch {current_size})")
+    remaining = auto_ctx.get("samples_remaining")
     ema = auto_ctx.get("steady_state_bytes")
-    if ema is None:
+    if ema is None or remaining is None:
         ema = float(sample)
+        remaining = auto_ctx.get("samples_to_collect", 0)
     else:
         ema = 0.9 * ema + 0.1 * float(sample)
     auto_ctx["steady_state_bytes"] = ema
+    if remaining > 0:
+        auto_ctx["samples_remaining"] = remaining - 1
+        return
     observed_peak = max(auto_ctx.get("last_peak", 0.0), ema, float(sample))
     suggested_bs, per_sample = _estimate_batch_from_peak_usage(
         ema,
@@ -275,7 +292,43 @@ def _maybe_update_auto_batch(auto_ctx, local_rank, force=False):
     )
     suggested_bs = max(1, int(suggested_bs))
     if suggested_bs == current_size:
+        stable_count = auto_ctx.get("stable_counter", 0) + 1
+        auto_ctx["stable_counter"] = stable_count
+        pending = auto_ctx.get("pending_verification", False)
+        stable_limit = auto_ctx.get("stable_limit", 0)
+        if pending or (stable_limit and stable_count >= stable_limit):
+            auto_ctx["auto_disabled"] = True
+            if auto_ctx.get("debug_samples"):
+                print(
+                    f"[auto-batch] Batch size stabilized at {current_size}; disabling further sampling."
+                )
+            auto_ctx["pending_verification"] = False
+            auto_ctx["request_restart"] = True
+            auto_ctx["restart_batch_size"] = current_size
+            return
+        auto_ctx["samples_remaining"] = auto_ctx.get("samples_to_collect", 0)
+        auto_ctx["cooldown_counter"] = auto_ctx.get("cooldown_steps", 0)
         return
+
+    prev_size = auto_ctx.get("last_batch_size")
+    if (
+        prev_size
+        and prev_size == suggested_bs + 1
+        and current_size == suggested_bs - 1
+    ):
+        controller.set(prev_size)
+        auto_ctx["opt_ref"].batchsize = prev_size
+        auto_ctx["auto_disabled"] = True
+        auto_ctx["request_restart"] = True
+        auto_ctx["restart_batch_size"] = prev_size
+        if auto_ctx.get("debug_samples"):
+            print(
+                f"[auto-batch] Detected oscillation around {suggested_bs}; "
+                f"locking batch size at {prev_size}."
+            )
+        return
+    auto_ctx["stable_counter"] = 0
+    auto_ctx["last_batch_size"] = suggested_bs
     exchange = auto_ctx["exchange_tensor"]
     exchange[0] = current_size
     if local_rank == 0:
@@ -287,7 +340,12 @@ def _maybe_update_auto_batch(auto_ctx, local_rank, force=False):
     if new_size == current_size:
         return
     controller.set(new_size)
+    auto_ctx["last_batch_size"] = new_size
     auto_ctx["last_peak"] = observed_peak
+    auto_ctx["steady_state_bytes"] = None
+    auto_ctx["samples_remaining"] = 1
+    auto_ctx["pending_verification"] = True
+    auto_ctx["auto_disabled"] = False
     auto_ctx["last_per_sample"] = per_sample
     if "opt_ref" in auto_ctx and auto_ctx["opt_ref"] is not None:
         auto_ctx["opt_ref"].batchsize = new_size
@@ -648,7 +706,12 @@ def main(opt):
             "opt_ref": opt,
             "max_batch_size": getattr(opt, "auto_batch_max", 128),
             "cooldown_steps": max(0, int(getattr(opt, "auto_batch_cooldown", 0))),
-            "cooldown_counter": 0,
+            "cooldown_counter": max(0, int(getattr(opt, "auto_batch_cooldown", 0))),
+            "samples_to_collect": max(1, int(getattr(opt, "auto_batch_samples", 5))),
+            "samples_remaining": max(1, int(getattr(opt, "auto_batch_samples", 5))),
+            "debug_samples": getattr(opt, "auto_batch_debug", False),
+            "stable_limit": max(0, int(getattr(opt, "auto_batch_stable_checks", 0))),
+            "stable_counter": 0,
         }
 
     try:
@@ -683,6 +746,8 @@ def main(opt):
 
             if getattr(opt, "auto_batchsize", False) and auto_batch_ctx is not None:
                 opt.batchsize = auto_batch_ctx["controller"].get()
+            if auto_batch_ctx and auto_batch_ctx.get("request_restart"):
+                raise _AutoBatchRestart(auto_batch_ctx.get("restart_batch_size", opt.batchsize))
 
             try:
                 if local_rank == 0 and epoch > 0 and epoch % opt.save_every == 0:
@@ -707,6 +772,18 @@ def main(opt):
 
         print("end:", datetime.datetime.now().strftime("%m/%d/%Y, %H:%M:%S"))
         print("Total time taken: ", str(datetime.datetime.now() - start_time).split(".")[0])
+    except _AutoBatchRestart as restart_exc:
+        if getattr(opt, "_restart_done", False):
+            print("[auto-batch] Restart already performed once; continuing without another restart.")
+        else:
+            print(
+                f"[auto-batch] Restarting training with stabilized batch size {restart_exc.batch_size}."
+            )
+            new_opt = copy.deepcopy(opt)
+            new_opt.auto_batchsize = False
+            new_opt.batchsize = restart_exc.batch_size
+            new_opt._restart_done = True
+            return main(new_opt)
     finally:
         if torch.distributed.is_initialized():
             torch.distributed.destroy_process_group()
@@ -800,6 +877,23 @@ if __name__ == "__main__":
         type=int,
         default=2,
         help="Number of batch iterations to wait before re-evaluating auto batch size after a change.",
+    )
+    parser.add_argument(
+        "--auto_batch_samples",
+        type=int,
+        default=5,
+        help="Number of steady-state samples to collect before evaluating auto batch size.",
+    )
+    parser.add_argument(
+        "--auto_batch_debug",
+        action="store_true",
+        help="Print VRAM samples and decisions made by the auto batch estimator.",
+    )
+    parser.add_argument(
+        "--auto_batch_stable_checks",
+        type=int,
+        default=20,
+        help="Disable auto-batching after this many consecutive checks suggest no batch-size change (0 keeps it enabled).",
     )
     parser.add_argument(
         "--imagesize",

@@ -8,9 +8,9 @@
   "object": [
     "Antenna"
   ],
-  "workers": 16,
-  "batchsize": 10,
-  "auto_batchsize": true,
+  "workers": 12,
+  "batchsize": 25,
+  "auto_batchsize": false,
   "auto_batch_headroom": 1e9,
   "auto_batch_max": 128,
   "imagesize": 448,
@@ -26,5 +26,8 @@
   "sigma": 4,
   "accuracy_px_tolerance": 5.0,
   "save": false,
-  "auto_batch_cooldown": 35
+  "auto_batch_cooldown": 40,
+  "auto_batch_samples": 5,
+  "auto_batch_debug": true,
+  "auto_batch_stable_checks": 20
 }
