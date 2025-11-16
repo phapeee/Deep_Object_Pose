@@ -23,6 +23,8 @@
   "outf": "output/weights",
   "nb_checkpoints": 1,
   "save_every": 1,
+  "max_runtime_seconds": 0,
+  "time_threshold_seconds": 60,
   "sigma": 4,
   "accuracy_px_tolerance": 5.0,
   "save": false,

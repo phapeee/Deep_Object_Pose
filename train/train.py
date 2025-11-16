@@ -678,6 +678,24 @@ def main(opt):
 
     print("ready to train!")
     start_time = datetime.datetime.now()
+    runtime_limit_seconds = 0.0
+    runtime_limit_source = "max_runtime_seconds"
+    configured_threshold = getattr(opt, "time_threshold_seconds", None)
+    if configured_threshold is not None and configured_threshold > 0:
+        runtime_limit_seconds = float(configured_threshold)
+        runtime_limit_source = "time_threshold_seconds"
+    else:
+        runtime_limit_seconds = float(getattr(opt, "max_runtime_seconds", 0) or 0)
+    runtime_limit_seconds = max(0.0, runtime_limit_seconds)
+    runtime_timer_start = time.monotonic()
+    ready_to_exit = False
+    opt.ready_to_exit = False
+    if runtime_limit_seconds > 0 and local_rank == 0:
+        limit_minutes = runtime_limit_seconds / 60.0
+        print(
+            f"[runtime limit] Will request shutdown after ~{runtime_limit_seconds:.0f}s "
+            f"({limit_minutes:.2f} min) once the current epoch completes (config: {runtime_limit_source})."
+        )
     print("start:", start_time.strftime("%m/%d/%Y, %H:%M:%S"))
 
     ckpt_q = None
@@ -744,6 +762,32 @@ def main(opt):
                 if writer is not None:
                     writer.add_scalar("metrics/samples_per_sec", samples_per_sec, epoch)
 
+            elapsed_since_start = time.monotonic() - runtime_timer_start
+            opt.elapsed_runtime_seconds = elapsed_since_start
+            if local_rank == 0:
+                if runtime_limit_seconds > 0:
+                    remaining = max(0.0, runtime_limit_seconds - elapsed_since_start)
+                    print(
+                        "[runtime] Elapsed "
+                        f"{elapsed_since_start:.2f}s since start "
+                        f"(threshold {runtime_limit_seconds:.2f}s, "
+                        f"{remaining:.2f}s remaining)."
+                    )
+                else:
+                    print(
+                        f"[runtime] Elapsed {elapsed_since_start:.2f}s since start (no threshold set)."
+                    )
+
+            if runtime_limit_seconds > 0 and not ready_to_exit:
+                if elapsed_since_start >= runtime_limit_seconds:
+                    ready_to_exit = True
+                    opt.ready_to_exit = True
+                    if local_rank == 0:
+                        print(
+                            "[runtime limit] Threshold exceeded; finishing after this epoch. "
+                            f"Elapsed {elapsed_since_start:.2f}s (limit {runtime_limit_seconds:.2f}s)."
+                        )
+
             if getattr(opt, "auto_batchsize", False) and auto_batch_ctx is not None:
                 opt.batchsize = auto_batch_ctx["controller"].get()
             if auto_batch_ctx and auto_batch_ctx.get("request_restart"):
@@ -763,6 +807,11 @@ def main(opt):
 
             except Exception as e:
                 print(f"Encountered Exception: {e}")
+
+            if ready_to_exit:
+                if local_rank == 0:
+                    print(f"[runtime limit] Graceful stop requested; exiting after epoch {epoch}.")
+                break
 
         if local_rank == 0:
             torch.save(
@@ -966,6 +1015,24 @@ if __name__ == "__main__":
         ),
     )
     parser.add_argument("--save", action="store_true", help="save a batch and quit")
+    parser.add_argument(
+        "--max_runtime_seconds",
+        type=float,
+        default=0,
+        help=(
+            "Maximum allowed runtime in seconds before requesting a graceful shutdown "
+            "after the current epoch finishes (0 disables the limit)."
+        ),
+    )
+    parser.add_argument(
+        "--time_threshold_seconds",
+        type=float,
+        default=0,
+        help=(
+            "Optional alias for max runtime that is also exposed via the JSON config. "
+            "Once elapsed time exceeds the threshold we finish the active epoch and exit."
+        ),
+    )
 
     config_path = None
     if args.config:
