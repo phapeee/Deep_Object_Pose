@@ -1,0 +1,30 @@
+{
+  "data": [
+    "./data/AntennaTrainingData"
+  ],
+  "use_s3": false,
+  "train_buckets": [],
+  "endpoint": null,
+  "object": [
+    "Antenna"
+  ],
+  "workers": 16,
+  "batchsize": 10,
+  "auto_batchsize": true,
+  "auto_batch_headroom": 1e9,
+  "auto_batch_max": 128,
+  "imagesize": 448,
+  "lr": 0.0001,
+  "net_path": null,
+  "namefile": "epoch",
+  "manualseed": null,
+  "epochs": 1,
+  "loginterval": 1,
+  "outf": "output/weights",
+  "nb_checkpoints": 1,
+  "save_every": 1,
+  "sigma": 4,
+  "accuracy_px_tolerance": 5.0,
+  "save": false,
+  "auto_batch_cooldown": 35
+}

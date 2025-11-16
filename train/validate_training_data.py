@@ -6,6 +6,8 @@ import os
 import sys
 from pathlib import Path
 
+DEFAULT_METADATA_NAME = ".dope_processed_folders.json"
+
 ROOT_DIR = Path(__file__).resolve().parents[1]
 COMMON_DIR = ROOT_DIR / "common"
 if str(COMMON_DIR) not in sys.path:
@@ -23,11 +25,15 @@ def _format_extensions(exts):
     return tuple(_normalize_extension(ext) for ext in exts)
 
 
-def _estimate_total_frames(datasets, extensions):
+def _estimate_total_frames(datasets, extensions, skip_map=None):
     total = 0
+    skip_map = skip_map or {}
     for dataset in datasets:
         abs_path = os.path.abspath(dataset)
-        for root, _, files in os.walk(abs_path):
+        skip_dirs = skip_map.get(abs_path, set())
+        for root, dirs, files in os.walk(abs_path):
+            if skip_dirs and root == abs_path:
+                dirs[:] = [d for d in dirs if d not in skip_dirs]
             max_idx = 0
             for file in files:
                 if not file.lower().endswith(extensions):
@@ -74,15 +80,98 @@ def _verify_json_files(entries):
         )
 
 
-def _collect_entries(dataset_paths, extensions):
+def _load_processed_dirs(metadata_path, reset=False):
+    if metadata_path is None or reset:
+        return set()
+    if not metadata_path.exists():
+        return set()
+    try:
+        payload = json.loads(metadata_path.read_text())
+    except Exception as exc:
+        print(f"[WARN] Could not parse metadata '{metadata_path}': {exc}")
+        return set()
+    entries = payload.get("processed_folders", [])
+    return {str(item) for item in entries}
+
+
+def _write_processed_dirs(metadata_path, directories):
+    if metadata_path is None:
+        return
+    metadata_path.parent.mkdir(parents=True, exist_ok=True)
+    metadata_path.write_text(
+        json.dumps({"processed_folders": sorted(set(directories))}, indent=2)
+    )
+
+
+def _prune_missing_dirs(dataset_root, directories):
+    if not directories:
+        return set()
+    existing = {
+        entry.name
+        for entry in Path(dataset_root).iterdir()
+        if entry.is_dir()
+    }
+    return {name for name in directories if name in existing}
+
+
+def _collect_entries(
+    dataset_paths,
+    extensions,
+    metadata_name=DEFAULT_METADATA_NAME,
+    reset_metadata=False,
+):
     normalized_exts = _format_extensions(extensions)
-    estimated_total = _estimate_total_frames(dataset_paths, normalized_exts)
-    processed = 0
-    all_entries = []
+    metadata_enabled = bool(metadata_name)
+    dataset_contexts = []
     for dataset in dataset_paths:
         abs_dataset = os.path.abspath(dataset)
+        if not os.path.isdir(abs_dataset):
+            print(f"[WARN] '{abs_dataset}' is not a directory. Skipping.")
+            continue
+        ctx = {
+            "abs_path": abs_dataset,
+            "metadata_path": None,
+            "stored_dirs": set(),
+            "processed_dirs": set(),
+            "new_dirs": set(),
+        }
+        if metadata_enabled:
+            metadata_path = Path(abs_dataset) / metadata_name
+            stored = _load_processed_dirs(metadata_path, reset=reset_metadata)
+            pruned = _prune_missing_dirs(abs_dataset, stored)
+            ctx.update(
+                {
+                    "metadata_path": metadata_path,
+                    "stored_dirs": stored,
+                    "processed_dirs": pruned,
+                }
+            )
+        dataset_contexts.append(ctx)
+
+    if not dataset_contexts:
+        return []
+
+    skip_map = (
+        {ctx["abs_path"]: ctx["processed_dirs"] for ctx in dataset_contexts}
+        if metadata_enabled
+        else None
+    )
+    estimated_total = _estimate_total_frames(
+        [ctx["abs_path"] for ctx in dataset_contexts],
+        normalized_exts,
+        skip_map=skip_map,
+    )
+
+    processed = 0
+    all_entries = []
+    for ctx in dataset_contexts:
+        abs_dataset = ctx["abs_path"]
+        processed_dirs = ctx["processed_dirs"]
+        metadata_path = ctx["metadata_path"]
         dataset_start = len(all_entries)
-        for root, _, files in os.walk(abs_dataset):
+        for root, dirs, files in os.walk(abs_dataset):
+            if metadata_enabled and processed_dirs and root == abs_dataset:
+                dirs[:] = [d for d in dirs if d not in processed_dirs]
             for file in files:
                 if not file.lower().endswith(normalized_exts):
                     continue
@@ -92,8 +181,17 @@ def _collect_entries(dataset_paths, extensions):
                 _print_progress(processed, estimated_total)
                 if os.path.isfile(json_path):
                     all_entries.append((img_path, file, json_path))
+                    if metadata_enabled:
+                        rel_path = os.path.relpath(img_path, abs_dataset)
+                        parts = rel_path.split(os.sep)
+                        if len(parts) > 1:
+                            ctx["new_dirs"].add(parts[0])
         dataset_count = len(all_entries) - dataset_start
         print(f"\n{abs_dataset}: {dataset_count} image(s) with annotations found.")
+        if metadata_enabled and metadata_path:
+            updated_dirs = ctx["processed_dirs"] | ctx["new_dirs"]
+            if updated_dirs != ctx["stored_dirs"]:
+                _write_processed_dirs(metadata_path, updated_dirs)
     print()
     return all_entries
 
@@ -102,7 +200,7 @@ def main():
     parser = argparse.ArgumentParser(
         description=(
             "Validate local DOPE training data and optionally write a manifest "
-            "file that train.py can consume via --data_manifest."
+            "file that train.py can consume via --training_manifest."
         )
     )
     parser.add_argument(
@@ -114,8 +212,11 @@ def main():
     parser.add_argument(
         "--output",
         "-o",
-        default="training_manifest.json",
-        help="Where to write the manifest JSON (default: training_manifest.json).",
+        default=None,
+        help=(
+            "Where to write the manifest JSON (default: training_manifest.json "
+            "inside the dataset directory)."
+        ),
     )
     parser.add_argument(
         "--extensions",
@@ -128,9 +229,33 @@ def main():
         action="store_true",
         help="Open every annotation JSON to ensure it is parseable.",
     )
+    parser.add_argument(
+        "--metadata-name",
+        default=DEFAULT_METADATA_NAME,
+        help=(
+            "Filename created in each dataset root to store processed subfolders "
+            f"(default: {DEFAULT_METADATA_NAME})."
+        ),
+    )
+    parser.add_argument(
+        "--disable-metadata",
+        action="store_true",
+        help="Skip metadata tracking so every subfolder is rescanned.",
+    )
+    parser.add_argument(
+        "--reset-metadata",
+        action="store_true",
+        help="Ignore existing metadata files and rewrite them after this run.",
+    )
     args = parser.parse_args()
 
-    entries = _collect_entries(args.data, extensions=args.extensions)
+    metadata_name = None if args.disable_metadata else args.metadata_name
+    entries = _collect_entries(
+        args.data,
+        extensions=args.extensions,
+        metadata_name=metadata_name,
+        reset_metadata=args.reset_metadata,
+    )
     if not entries:
         print("No training samples were discovered. Nothing to validate.")
         return
@@ -147,12 +272,17 @@ def main():
         for (img_path, img_name, json_path) in entries
     ]
 
-    output_path = Path(args.output).expanduser().resolve()
+    if args.output:
+        output_path = Path(args.output).expanduser().resolve()
+    else:
+        dataset_root = Path(args.data[0]).expanduser().resolve()
+        output_path = dataset_root / "training_manifest.json"
+
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(json.dumps(manifest, indent=2))
     print(
         f"Saved manifest with {len(manifest)} entries to '{output_path}'. "
-        "Pass this path to train.py via --data_manifest to skip the directory scan."
+        "Pass this path to train.py via --training_manifest to skip the directory scan."
     )
 
 
