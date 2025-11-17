@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 
 import argparse
+import json
 import multiprocessing
 import os
+from pathlib import Path
 from queue import Queue
 import re
 import subprocess
@@ -26,6 +28,11 @@ parser.add_argument(
     help='Number of parallel blenderproc workers to run.  The default of 0 will create '
     'one worker for every CPU core'
 )
+parser.add_argument(
+    '--config',
+    default=None,
+    help='Path to sence_config.json containing datagen_defaults used as CLI arguments.'
+)
 
 
 opt, unknown = parser.parse_known_args()
@@ -34,13 +41,68 @@ num_workers = min(opt.nb_workers, multiprocessing.cpu_count())
 if num_workers == 0:
     num_workers = multiprocessing.cpu_count()
 
-amount_of_runs = opt.nb_runs
-
 # set the folder in which the generation script is located
 rerun_folder = os.path.abspath(os.path.dirname(__file__))
 
 progress = {}
 progress_lock = threading.Lock()
+
+
+def _default_config_path():
+    repo_root = Path(__file__).resolve().parents[2]
+    candidate = repo_root / "config" / "sence_config.json"
+    if candidate.is_file():
+        return candidate
+    return None
+
+
+def load_datagen_defaults(config_path=None):
+    candidate = Path(config_path) if config_path else _default_config_path()
+    if not candidate or not candidate.is_file():
+        return None
+    try:
+        data = json.loads(candidate.read_text())
+    except Exception:
+        return None
+    defaults = data.get("datagen_defaults")
+    if not isinstance(defaults, dict):
+        return None
+    cleaned = {}
+    for key, value in defaults.items():
+        cleaned[str(key)] = value
+    return cleaned
+
+
+def existing_cli_flags(args_list):
+    flags = set()
+    for token in args_list:
+        if token.startswith("--"):
+            flag = token.split("=", 1)[0]
+            flags.add(flag)
+    return flags
+
+
+def convert_defaults_to_args(defaults, skip_flags):
+    if not defaults:
+        return []
+    result = []
+    for key, value in defaults.items():
+        flag = f"--{key}"
+        if flag in skip_flags:
+            continue
+        if isinstance(value, bool):
+            if value:
+                result.append(flag)
+            continue
+        if isinstance(value, list):
+            if not value:
+                continue
+            result.append(flag)
+            result.extend(str(item) for item in value)
+            continue
+        result.append(flag)
+        result.append(str(value))
+    return result
 
 
 def format_progress():
@@ -63,7 +125,7 @@ def stream_output(proc, run_id):
         if "Finished rendering after" in stripped:
             continue
 
-        match = re.match(r"Run (\d+): (\d+)/(\d+)", stripped)
+        match = re.match(r"Run (\d+)(?: [^:]+)?: (\d+)/(\d+)", stripped)
         if match:
             _, current, total = match.groups()
             with progress_lock:
@@ -77,6 +139,20 @@ def stream_output(proc, run_id):
 
 Q = Queue(maxsize = num_workers)
 active_processes = []
+
+config_defaults = load_datagen_defaults(opt.config)
+config_nb_runs = None
+if config_defaults and "nb_runs" in config_defaults:
+    try:
+        config_nb_runs = int(config_defaults.pop("nb_runs"))
+    except (TypeError, ValueError):
+        config_nb_runs = None
+
+default_nb_runs = parser.get_default('nb_runs')
+if opt.nb_runs == default_nb_runs and config_nb_runs is not None:
+    amount_of_runs = config_nb_runs
+else:
+    amount_of_runs = opt.nb_runs
 
 def wait_for_process():
     run_identifier, proc, thread = Q.get()
@@ -94,6 +170,8 @@ try:
 
         # execute one BlenderProc run
         cmd = ["blenderproc", "run", os.path.join(rerun_folder, "generate_training_data.py")]
+        skip_flags = existing_cli_flags(unknown)
+        cmd.extend(convert_defaults_to_args(config_defaults, skip_flags))
         cmd.extend(unknown)
         cmd.extend(['--run_id', str(run_id)])
         p = subprocess.Popen(

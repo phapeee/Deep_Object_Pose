@@ -1,27 +1,38 @@
 {
-  "rotational_range": {
-    "default": {
-      "pitch": [
-        -180,
-        180
-      ],
-      "yaw": [
-        -5,
-        5
-      ],
-      "roll": [
-        -5,
-        5
-      ]
-    }
+  "datagen_defaults": {
+    "nb_runs": 8,
+    "frames_per_cycle": 10,
+    "restart_cycles": 10,
+    "path_single_obj": "./data/models/antenna/antenna.obj",
+    "nb_objects": 1,
+    "object_class": "Antenna",
+    "distractors_folder": "./data/google_scanned_models/",
+    "nb_distractors": 5,
+    "backgrounds_folder": "./data/dome_hdri_haven/",
+    "outf": "./data/AntennaData"
   },
   "HDRI_backgrounds": {
     "enabled": true,
     "selection_method": "iterate",
     "count": "all",
     "strength_range": [
-      0.1,
-      0.5
+      0.01,
+      0.05
+    ]
+  },
+  "sence_rotation": {
+    "enabled": true,
+    "pitch_range": [
+      0,
+      0
+    ],
+    "yaw_range": [
+      0,
+      0
+    ],
+    "roll_range": [
+      -180,
+      180
     ]
   }
 }

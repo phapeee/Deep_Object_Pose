@@ -7,9 +7,30 @@
         "color_list": [],
         "intensity": [
           1000,
-          5000
+          6000
         ]
       }
-    ]
+    ],
+    "exclude_parts": [
+      {
+        "name": "Shaft",
+        "visible": true,
+        "in_bbox": false
+      }
+    ],
+    "rotational_range": {
+      "pitch": [
+        -180,
+        180
+      ],
+      "yaw": [
+        -5,
+        5
+      ],
+      "roll": [
+        -5,
+        5
+      ]
+    }
   }
 }

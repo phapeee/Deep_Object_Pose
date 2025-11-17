@@ -217,6 +217,8 @@ def load_hdri_background_config(config_path, config_data=None):
                 count_value = None
     elif isinstance(raw_count, (int, float)):
         count_value = int(raw_count)
+    if isinstance(count_value, int) and count_value < 1:
+        count_value = None
 
     return {
         "selection_method": selection,
@@ -257,6 +259,39 @@ def load_background_overlay_config(config_path, config_data=None):
     }
 
 
+def load_scene_rotation_config(config_path, config_data=None):
+    data = config_data if config_data is not None else load_sence_config_data(config_path)
+    if not data:
+        return None
+    rot_cfg = data.get("sence_rotation") or data.get("scene_rotation")
+    if not isinstance(rot_cfg, dict):
+        return None
+    if not bool(rot_cfg.get("enabled", False)):
+        return None
+
+    def parse_axis(name):
+        values = rot_cfg.get(f"{name}_range")
+        if not isinstance(values, (list, tuple)) or len(values) < 2:
+            return (0.0, 0.0)
+        try:
+            lo = float(values[0])
+            hi = float(values[1])
+        except (TypeError, ValueError):
+            lo = hi = 0.0
+        if lo > hi:
+            lo, hi = hi, lo
+        # convert degrees to radians
+        lo = lo * (pi / 180.0)
+        hi = hi * (pi / 180.0)
+        return (lo, hi)
+
+    return {
+        "pitch": parse_axis("pitch"),
+        "yaw": parse_axis("yaw"),
+        "roll": parse_axis("roll")
+    }
+
+
 def select_backgrounds_for_hdr(runtime):
     if not runtime or not runtime["paths"]:
         return [None]
@@ -278,7 +313,9 @@ def select_backgrounds_for_hdr(runtime):
     return [None]
 
 
-def get_rotation_ranges(rotation_config, class_name):
+def get_rotation_ranges(rotation_config, class_name, object_settings=None):
+    if object_settings and object_settings.get("rotational_range"):
+        return object_settings["rotational_range"]
     if not rotation_config:
         return None
     cls = class_name.lower()
@@ -332,6 +369,43 @@ def load_object_properties_config(config_path):
             return normalized
         return None
 
+    def normalize_flag(value):
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(value)
+        if isinstance(value, str):
+            val = value.strip().lower()
+            if val in {"true", "1", "yes", "on"}:
+                return True
+            if val in {"false", "0", "no", "off"}:
+                return False
+        return bool(value)
+
+    def normalize_range_pair(values):
+        if isinstance(values, (list, tuple)) and len(values) >= 2:
+            try:
+                lo = float(values[0])
+                hi = float(values[1])
+            except (TypeError, ValueError):
+                return None
+            if lo > hi:
+                lo, hi = hi, lo
+            return [lo, hi]
+        return None
+
+    def normalize_rotational_limits(raw):
+        if not isinstance(raw, dict):
+            return None
+        cleaned = {}
+        for axis in ("pitch", "yaw", "roll"):
+            rng = normalize_range_pair(raw.get(axis))
+            if rng is not None:
+                cleaned[axis] = rng
+        return cleaned or None
+
     for cls, props in data.items():
         if not isinstance(props, dict):
             continue
@@ -354,6 +428,26 @@ def load_object_properties_config(config_path):
                 })
             if cleaned:
                 entry["emissive"] = cleaned
+        excludes = props.get("exclude_parts") or props.get("ExcludeParts")
+        if isinstance(excludes, list):
+            cleaned_excludes = []
+            for item in excludes:
+                if not isinstance(item, dict):
+                    continue
+                name = item.get("name")
+                if not name:
+                    continue
+                cleaned_excludes.append({
+                    "name": str(name),
+                    "visible": normalize_flag(item.get("visible")),
+                    "in_bbox": normalize_flag(item.get("in_bbox"))
+                })
+            if cleaned_excludes:
+                entry["exclude_parts"] = cleaned_excludes
+        rotation_limits = props.get("rotational_range") or props.get("RotationalRange")
+        rotation_limits = normalize_rotational_limits(rotation_limits)
+        if rotation_limits:
+            entry["rotational_range"] = rotation_limits
         if entry:
             normalized[cls.lower()] = entry
     return normalized if normalized else None
@@ -438,6 +532,179 @@ def get_object_properties(properties_config, class_name):
 
 
 _missing_emissive_targets = set()
+_missing_exclude_targets = set()
+
+
+def _match_subparts_by_name(subparts, target_name, missing_registry, class_name, purpose):
+    """Return list of subparts whose Blender name contains target_name (case-insensitive)."""
+    if not subparts:
+        return []
+    target = (target_name or "").strip()
+    if not target:
+        return list(subparts)
+    target_lower = target.lower()
+    matches = []
+    for part in subparts:
+        try:
+            name = part.get_name() or ""
+        except Exception:
+            name = ""
+        if target_lower in name.lower():
+            matches.append(part)
+    if not matches and missing_registry is not None:
+        key = f"{class_name}:{target_lower}"
+        if key not in missing_registry:
+            missing_registry.add(key)
+            print(f"Warning: Could not find part named '{target}' for class '{class_name}' when applying {purpose}.")
+    return matches
+
+
+def apply_exclude_part_settings(subparts, exclude_cfg, class_name):
+    """Toggle part visibility based on exclude_parts config entries."""
+    if not exclude_cfg:
+        return
+    for entry in exclude_cfg:
+        targets = _match_subparts_by_name(
+            subparts,
+            entry.get("name"),
+            _missing_exclude_targets,
+            class_name,
+            "exclude_parts visibility",
+        )
+        if not targets:
+            continue
+        visible = entry.get("visible")
+        if visible is None:
+            continue
+        visibility_flag = bool(visible)
+        for part in targets:
+            _set_part_visibility(part, visibility_flag)
+
+
+def _set_part_visibility(part, visible):
+    """Hide or show the given MeshObject by toggling Blender visibility flags."""
+    blender_obj = getattr(part, "blender_obj", None)
+    if blender_obj is None:
+        return
+    try:
+        blender_obj.hide_render = not visible
+    except Exception:
+        pass
+    try:
+        blender_obj.hide_viewport = not visible
+    except Exception:
+        pass
+    try:
+        blender_obj.hide_set(not visible)
+    except Exception:
+        pass
+
+
+def prepare_bbox_part_overrides(subparts, properties, class_name):
+    """
+    Precompute which mesh parts should contribute to the cuboid bounding box.
+
+    Returns:
+        None if default behavior should be used, or a list of MeshObjects that
+        remain after exclusions.
+    """
+    if not properties:
+        return None
+    exclude_cfg = properties.get("exclude_parts")
+    if not exclude_cfg:
+        return None
+    include_list = list(subparts)
+    custom_bbox = False
+    for entry in exclude_cfg:
+        targets = _match_subparts_by_name(
+            subparts,
+            entry.get("name"),
+            _missing_exclude_targets,
+            class_name,
+            "exclude_parts in_bbox",
+        )
+        if not targets:
+            continue
+        in_bbox = entry.get("in_bbox")
+        if in_bbox is None:
+            continue
+        in_bbox_flag = bool(in_bbox)
+        for part in targets:
+            if in_bbox_flag:
+                if part not in include_list:
+                    include_list.append(part)
+            else:
+                custom_bbox = True
+                if part in include_list:
+                    include_list.remove(part)
+    if not custom_bbox:
+        return None
+    if not include_list:
+        print(f"Warning: All parts were excluded from bounding box for class '{class_name}'. Falling back to full mesh.")
+        return None
+    return include_list
+
+
+def compute_bbox_override_points(parts, rotation, translation, scale):
+    """
+    Build custom bounding box corner coordinates based on a subset of parts.
+
+    rotation: 3x3 matrix describing object orientation.
+    translation: length-3 vector for object origin.
+    scale: length-3 vector describing object scale applied after rotation.
+    """
+    if not parts:
+        return None
+    rot = np.array(rotation)
+    trans = np.array(translation)
+    scale_vec = np.array(scale)
+    if scale_vec.shape != (3,):
+        scale_vec = np.array([scale_vec[0], scale_vec[1], scale_vec[2]])
+    rot_T = rot.transpose()
+    normalized_points = []
+    for part in parts:
+        try:
+            bbox = part.get_bound_box()
+        except Exception:
+            bbox = None
+        if bbox is None:
+            continue
+        bbox = np.array(bbox)
+        if bbox.size == 0:
+            continue
+        for corner in bbox:
+            world_corner = np.array(corner)
+            local = rot_T @ (world_corner - trans)
+            local = np.divide(local, scale_vec, out=np.zeros_like(local), where=scale_vec!=0)
+            normalized_points.append(local)
+    if not normalized_points:
+        return None
+    pts = np.stack(normalized_points, axis=0)
+    min_vals = pts.min(axis=0)
+    max_vals = pts.max(axis=0)
+    return _construct_world_bbox_from_extents(min_vals, max_vals, rot, trans, scale_vec)
+
+
+def _construct_world_bbox_from_extents(min_vals, max_vals, rotation, translation, scale_vec):
+    """Create 8 bounding-box corner coordinates in world space given extents in object-local space."""
+    min_x, min_y, min_z = min_vals
+    max_x, max_y, max_z = max_vals
+    local_points = [
+        [min_x, min_y, min_z],
+        [min_x, min_y, max_z],
+        [min_x, max_y, min_z],
+        [min_x, max_y, max_z],
+        [max_x, min_y, min_z],
+        [max_x, min_y, max_z],
+        [max_x, max_y, min_z],
+        [max_x, max_y, max_z],
+    ]
+    world_points = []
+    for point in local_points:
+        local = np.array(point) * scale_vec
+        world = rotation @ local + translation
+        world_points.append(world.tolist())
+    return world_points
 
 def pick_emissive_color(entry):
     color_spec = entry.get("color")
@@ -506,6 +773,9 @@ def apply_object_properties(subparts, properties, class_name):
     if emissive_cfg:
         for entry in emissive_cfg:
             apply_emissive_property(subparts, entry, class_name)
+    exclude_cfg = properties.get("exclude_parts")
+    if exclude_cfg:
+        apply_exclude_part_settings(subparts, exclude_cfg, class_name)
 
 def apply_emissive_property(subparts, entry, class_name):
     if not should_enable_emissive(entry):
@@ -622,9 +892,12 @@ def scale_to_original_shape(img, o_width, o_height):
     return cropped.resize((o_width, o_height))
 
 
-def get_cuboid_image_space(mesh, camera):
+def get_cuboid_image_space(mesh, camera, bbox_override=None):
     # object aligned bounding box coordinates in world coordinates
-    bbox = mesh.get_bound_box()
+    bbox_source = bbox_override if bbox_override is not None else mesh.get_bound_box()
+    bbox = np.array(bbox_source, dtype=float)
+    if bbox.ndim != 2 or bbox.shape[0] < 8 or bbox.shape[1] < 3:
+        raise ValueError("Invalid bounding box data for projection.")
     '''
     bbox is a list of the world-space coordinates of the corners of a
     blender object's oriented bounding box
@@ -686,7 +959,7 @@ def get_cuboid_image_space(mesh, camera):
     return np.array(cuboid, dtype=float).tolist()
 
 
-def write_json(outf, args, camera, objects, objects_data, seg_map):
+def write_json(outf, args, camera, objects, objects_data, seg_map, projected_cuboids=None):
     cam_xform = camera.get_camera_pose()
     eye = -cam_xform[0:3,3]
     at = -cam_xform[0:3,2]
@@ -735,7 +1008,10 @@ def write_json(outf, args, camera, objects, objects_data, seg_map):
 
         if num_pixels < args.min_pixels:
             continue
-        projected_keypoints = get_cuboid_image_space(oo, camera)
+        if projected_cuboids and projected_cuboids[ii]:
+            projected_keypoints = projected_cuboids[ii]
+        else:
+            projected_keypoints = get_cuboid_image_space(oo, camera)
 
         data['objects'].append({
             'class': objects_data[ii]['class'],
@@ -754,13 +1030,16 @@ def write_json(outf, args, camera, objects, objects_data, seg_map):
     return data
 
 
-def draw_cuboid_markers(objects, camera, im):
+def draw_cuboid_markers(objects, camera, im, projected_cuboids=None):
     colors = ['yellow', 'magenta', 'blue', 'red', 'green', 'orange', 'brown', 'cyan', 'white']
     R = 2 # radius
     # draw dots on image to label the cuiboid vertices
     draw = ImageDraw.Draw(im)
-    for oo in objects:
-        projected_keypoints = get_cuboid_image_space(oo, camera)
+    for idx, oo in enumerate(objects):
+        if projected_cuboids and projected_cuboids[idx]:
+            projected_keypoints = projected_cuboids[idx]
+        else:
+            projected_keypoints = get_cuboid_image_space(oo, camera)
         for idx, pp in enumerate(projected_keypoints):
             x = int(pp[0])
             y = int(pp[1])
@@ -796,15 +1075,37 @@ def set_world_background_hdr(filename, strength=1.0, rotation_euler=None):
     if rotation_euler is None:
         rotation_euler = [0.0, 0.0, 0.0]
 
-    nodes = bpy.context.scene.world.node_tree.nodes
-    links = bpy.context.scene.world.node_tree.links
+    scene = bpy.context.scene
+    if scene.world is None:
+        scene.world = bpy.data.worlds.new("World")
+    world = scene.world
+    if not world.use_nodes:
+        world.use_nodes = True
+    if world.node_tree is None:
+        world.use_nodes = True
+    nodes = world.node_tree.nodes
+    links = world.node_tree.links
+
+    # Ensure background and output nodes exist
+    background_node = None
+    output_node = None
+    for node in nodes:
+        if node.type == 'BACKGROUND' and background_node is None:
+            background_node = node
+        elif node.type == 'OUTPUT_WORLD' and output_node is None:
+            output_node = node
+    if background_node is None:
+        background_node = nodes.new(type="ShaderNodeBackground")
+    if output_node is None:
+        output_node = nodes.new(type="ShaderNodeOutputWorld")
+    if not any(link.to_node == output_node and link.from_node == background_node for link in links):
+        links.new(background_node.outputs["Background"], output_node.inputs["Surface"])
 
     # add a texture node and load the image and link it
     texture_node = nodes.new(type="ShaderNodeTexEnvironment")
     texture_node.image = bpy.data.images.load(filename, check_existing=True)
 
     # get the background node of the world shader and link the new texture node
-    background_node = Utility.get_the_one_node_with_type(nodes, "Background")
     links.new(texture_node.outputs["Color"], background_node.inputs["Color"])
 
     # Set the brightness
@@ -820,12 +1121,33 @@ def set_world_background_hdr(filename, strength=1.0, rotation_euler=None):
 
     mapping_node.inputs["Rotation"].default_value = rotation_euler
 
+def pick_scene_rotation(scene_rotation_cfg):
+    if not scene_rotation_cfg:
+        return [
+            random.random() * 0.2 - 0.1,
+            random.random() * 0.2 - 0.1,
+            random.random() * 0.2 - 0.1,
+        ]
+    rotation = []
+    for axis in ("pitch", "yaw", "roll"):
+        lo, hi = scene_rotation_cfg.get(axis, (0.0, 0.0))
+        rotation.append(random.uniform(lo, hi))
+    return rotation
+
 
 def main(args):
+    cycles = max(1, int(getattr(args, "restart_cycles", 1)))
+    frame_offset = 0
+    for cycle_idx in range(cycles):
+        frame_offset = run_generation_cycle(args, cycle_idx, cycles, frame_offset)
+
+
+def run_generation_cycle(args, cycle_index=0, total_cycles=1, frame_offset=0):
     ## Segmentation values
     SEG_DISTRACT = 0
 
     ## All units used are in centimeters
+    base_scale_vec = np.array([args.scale, args.scale, args.scale], dtype=float)
 
     # Make output directories
     out_directory = os.path.join(args.outf, str(args.run_id))
@@ -835,10 +1157,22 @@ def main(args):
     rotation_config = load_rotation_config(args.rotation_config, config_data=sence_config_data)
     hdri_background_config = load_hdri_background_config(args.rotation_config, config_data=sence_config_data)
     background_overlay_config = load_background_overlay_config(args.rotation_config, config_data=sence_config_data)
+    scene_rotation_config = load_scene_rotation_config(args.rotation_config, config_data=sence_config_data)
     object_properties_config = load_object_properties_config(args.object_properties)
 
+    if cycle_index == 0:
+        bp.init()
+    else:
+        print(f"Restarting BlenderProc for cycle {cycle_index + 1}/{total_cycles}", flush=True)
+        bp.clean_up(clean_up_camera=True)
+
     # Construct list of background images
-    image_types = ('*.jpg', '*.jpeg', '*.JPG', '*.JPEG', '*.png', '*.PNG', '*.hdr', '*.HDR')
+    image_types = (
+        '*.jpg', '*.jpeg', '*.JPG', '*.JPEG',
+        '*.png', '*.PNG',
+        '*.hdr', '*.HDR',
+        '*.exr', '*.EXR'
+    )
     backdrop_images = []
     background_idx = 0  # index for cycling through backgrounds
 
@@ -875,8 +1209,22 @@ def main(args):
         if not hdr_backdrops:
             print("HDRI backgrounds enabled in config but no HDR files were found; ignoring that setting.")
         else:
+            selected_paths = list(hdr_backdrops)
+            if hdri_background_config["selection_method"] == "iterate":
+                desired_count = hdri_background_config.get("count")
+                if desired_count not in (None, "all"):
+                    try:
+                        take = int(desired_count)
+                    except (TypeError, ValueError):
+                        take = None
+                    if take is not None and take > 0:
+                        take = min(take, len(selected_paths))
+                        if take > 0:
+                            selected_paths = selected_paths[:take]
+            if not selected_paths:
+                selected_paths = list(hdr_backdrops)
             hdri_runtime = {
-                "paths": hdr_backdrops,
+                "paths": selected_paths,
                 "method": hdri_background_config["selection_method"],
                 "strength_range": hdri_background_config["strength_range"],
                 "random_selection": None
@@ -948,7 +1296,9 @@ def main(args):
             background_multiplier = background_overlay_runtime["random_count"]
     else:
         background_multiplier = 1
-    total_frames = frames_per_cycle * hdr_multiplier * background_multiplier
+    cycle_frame_target = frames_per_cycle * hdr_multiplier * background_multiplier
+    frame_counter = frame_offset
+    total_frames = frame_offset + cycle_frame_target
 
     def next_mixed_backdrop():
         nonlocal background_idx
@@ -985,12 +1335,6 @@ def main(args):
     # Construct list of distractors
     distractor_objs = glob.glob(args.distractors_folder + "**/model.obj", recursive=True)
     print(f"{len(distractor_objs)} distractor objects found.")
-
-    # Set up blenderproc
-    bp.init()
-    
-    # Make world background invisible to the camera, but keep it for lighting/reflections
-    bpy.context.scene.render.film_transparent = True
 
     # Set the camera to be in front of the object
     cam_pose = bp.math.build_transformation_mat([0, -25, 0], [np.pi / 2, 0, 0])
@@ -1029,6 +1373,7 @@ def main(args):
     objects = []
     object_subparts = []
     object_property_settings = []
+    object_bbox_overrides = []
     objects_data = []
     for idx in range(args.nb_objects):
         model_path =  object_models[random.randint(0, len(object_models) - 1)]
@@ -1056,7 +1401,9 @@ def main(args):
                             'name': obj_name,
                             'id':1+idx
                             })
-        object_property_settings.append(get_object_properties(object_properties_config, obj_class))
+        props = get_object_properties(object_properties_config, obj_class)
+        object_property_settings.append(props)
+        object_bbox_overrides.append(prepare_bbox_part_overrides(loaded_objs, props, obj_class))
         
     # Decide if we need glare based on object properties (but don't enable yet)
     glare_settings = None
@@ -1072,6 +1419,13 @@ def main(args):
         if glare_settings:
             break
 
+    # Track per-object transforms for custom bounding boxes
+    object_transform_states = [{
+        "rotation": np.eye(3),
+        "translation": np.zeros(3),
+        "scale": base_scale_vec.copy()
+    } for _ in objects]
+
     # Create distractor(s)
     distractors = []
     if len(distractor_objs) > 0:
@@ -1082,7 +1436,6 @@ def main(args):
             distractors.append(distractor)
             print(f"loaded {distractor_fn}")
 
-    frame_counter = 0
     if hdri_runtime:
         if hdri_runtime["method"] == "random":
             hdr_sequence = hdri_runtime["random_selection"] or []
@@ -1109,13 +1462,19 @@ def main(args):
                 overlays_to_apply = [fallback_overlay]
 
             overlays_to_apply = overlays_to_apply or [None]
+            should_overlay_background = any(bool(path) for path in overlays_to_apply)
+            # Use transparent film only when we plan to composite a 2D background later.
+            bpy.context.scene.render.film_transparent = should_overlay_background
 
             # Place object(s)
             for idx, oo in enumerate(objects):
                 xform = np.eye(4)
                 xform[0:3, 3] = random_object_position(near=20, far=100)
-                rot_ranges = get_rotation_ranges(rotation_config, objects_data[idx]['class'])
+                rot_ranges = get_rotation_ranges(rotation_config, objects_data[idx]['class'], object_property_settings[idx])
                 xform[0:3, 0:3] = random_rotation_matrix(rot_ranges)
+                object_transform_states[idx]["rotation"] = xform[0:3, 0:3].copy()
+                object_transform_states[idx]["translation"] = xform[0:3, 3].copy()
+                object_transform_states[idx]["scale"] = base_scale_vec.copy()
 
                 for part in object_subparts[idx]:
                     part.set_local2world_mat(xform)
@@ -1147,17 +1506,8 @@ def main(args):
                     strength_range = (0.5, 1.5)
                     method_label = "sequential"
                 strength = random.uniform(strength_range[0], strength_range[1])
-                rotation = [
-                    random.random() * 0.2 - 0.1,
-                    random.random() * 0.2 - 0.1,
-                    random.random() * 0.2 - 0.1,
-                ]
+                rotation = pick_scene_rotation(scene_rotation_config)
                 set_world_background_hdr(env_path, strength, rotation)
-                print(
-                    f"Run {args.run_id}: HDR '{os.path.basename(env_path)}' "
-                    f"(strength={strength:.2f}, method={method_label})",
-                    flush=True,
-                )
 
             # redirect blenderproc output to log file
             logfile = '/tmp/blender_render.log'
@@ -1179,11 +1529,29 @@ def main(args):
             os.close(old)
 
             base_image = Image.fromarray(data['colors'][0])
+            projected_cuboids = []
+            for obj_idx, obj in enumerate(objects):
+                bbox_override_pts = None
+                overrides = object_bbox_overrides[obj_idx]
+                if overrides is not None:
+                    transform = object_transform_states[obj_idx]
+                    bbox_override_pts = compute_bbox_override_points(
+                        overrides,
+                        transform["rotation"],
+                        transform["translation"],
+                        transform["scale"],
+                    )
+                projected = get_cuboid_image_space(obj, bp.camera, bbox_override=bbox_override_pts)
+                projected_cuboids.append(projected)
 
             for overlay_path in overlays_to_apply:
                 frame_id = frame_counter
                 frame_counter += 1
-                print(f"Run {args.run_id}: {frame_counter}/{total_frames}", flush=True)
+                print(
+                    f"Run {args.run_id} cycle {cycle_index + 1}/{total_cycles}: "
+                    f"{frame_counter}/{total_frames}",
+                    flush=True
+                )
 
                 im = base_image.copy()
 
@@ -1194,11 +1562,13 @@ def main(args):
                     im = background
 
                 if args.debug:
-                    im = draw_cuboid_markers(objects, bp.camera, im)
+                    im = draw_cuboid_markers(objects, bp.camera, im, projected_cuboids)
 
                 file_base = os.path.join(out_directory, f"{frame_id:06d}")
                 im.save(file_base + ".png")
-                write_json(file_base + ".json", args, bp.camera, objects, objects_data, captured_segmaps)
+                write_json(file_base + ".json", args, bp.camera, objects, objects_data, captured_segmaps, projected_cuboids)
+
+    return frame_counter
 
 
 if __name__ == "__main__":
@@ -1219,6 +1589,12 @@ if __name__ == "__main__":
         type=int,
         help='Output files will be put in a subdirectory of this name. This parameter should '
         'not be set by the user'
+    )
+    parser.add_argument(
+        '--restart_cycles',
+        default=1,
+        type=int,
+        help='Number of times to fully regenerate the scene. Each cycle cleans the Blender state before rendering.'
     )
     parser.add_argument(
         '--width',
