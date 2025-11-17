@@ -15,6 +15,7 @@ import os
 from pathlib import Path
 from queue import Queue
 import random
+import tarfile
 import time
 import warnings
 warnings.filterwarnings("ignore")
@@ -35,10 +36,30 @@ from tensorboardX import SummaryWriter
 
 import sys
 
+try:
+    from google.oauth2.credentials import Credentials as GoogleDriveCredentials
+    from google_auth_oauthlib.flow import InstalledAppFlow as GoogleDriveInstalledAppFlow
+    from google.auth.transport.requests import Request as GoogleDriveRequest
+    from googleapiclient.discovery import build as google_drive_build
+    from googleapiclient.http import MediaFileUpload as GoogleDriveMediaFileUpload
+except ImportError:
+    GoogleDriveCredentials = None
+    GoogleDriveInstalledAppFlow = None
+    GoogleDriveRequest = None
+    google_drive_build = None
+    GoogleDriveMediaFileUpload = None
+
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 COMMON_DIR = os.path.join(ROOT_DIR, "common")
 if COMMON_DIR not in sys.path:
     sys.path.insert(1, COMMON_DIR)
+
+OUTPUT_ROOT_DIR = Path(ROOT_DIR) / "output"
+OUTPUT_ARCHIVE_PATH = Path(ROOT_DIR) / "output.tar"
+GOOGLE_DRIVE_CREDENTIALS_PATH = Path(ROOT_DIR) / "gg_drive_credential.json"
+GOOGLE_DRIVE_TOKEN_PATH = Path(ROOT_DIR) / "gg_drive_token.json"
+GOOGLE_DRIVE_SCOPES = ["https://www.googleapis.com/auth/drive.file"]
+GOOGLE_DRIVE_PARENT_ID = os.environ.get("DOPE_GDRIVE_FOLDER_ID")
 
 from models import *
 from utils import *
@@ -137,6 +158,136 @@ def _write_manifest_file(manifest_path, entries):
     ]
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
     manifest_path.write_text(json.dumps(payload, indent=2))
+
+
+def _archive_output_directory(source_dir, archive_path):
+    source_dir = Path(source_dir)
+    archive_path = Path(archive_path)
+    if not source_dir.exists():
+        print(f"[gdrive] Output directory '{source_dir}' not found; skipping archive.")
+        return None
+    archive_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with tarfile.open(archive_path, "w") as tar:
+            tar.add(str(source_dir), arcname=source_dir.name)
+        print(f"[gdrive] Archived '{source_dir}' into '{archive_path}'.")
+        return archive_path
+    except Exception as exc:
+        print(f"[gdrive] Failed to create archive '{archive_path}': {exc}")
+        return None
+
+
+def _upload_file_to_google_drive(file_path, credentials_path, token_path=None, parent_folder_id=None):
+    if (
+        GoogleDriveCredentials is None
+        or GoogleDriveInstalledAppFlow is None
+        or GoogleDriveRequest is None
+        or google_drive_build is None
+        or GoogleDriveMediaFileUpload is None
+    ):
+        print("[gdrive] Google Drive libraries are not installed; skipping upload.")
+        return False
+
+    file_path = Path(file_path)
+    credentials_path = Path(credentials_path)
+    if token_path is not None:
+        token_path = Path(token_path)
+    else:
+        token_path = credentials_path.with_name("token.json")
+
+    if not credentials_path.exists():
+        print(f"[gdrive] Credential file '{credentials_path}' not found; skipping upload.")
+        return False
+    if not file_path.exists():
+        print(f"[gdrive] Archive '{file_path}' not found; skipping upload.")
+        return False
+
+    creds = None
+    if token_path is not None and token_path.exists():
+        try:
+            creds = GoogleDriveCredentials.from_authorized_user_file(
+                str(token_path), GOOGLE_DRIVE_SCOPES
+            )
+        except Exception as exc:
+            print(f"[gdrive] Failed to read token '{token_path}': {exc}. Requesting new token.")
+            try:
+                token_path.unlink()
+            except OSError:
+                pass
+            creds = None
+
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            try:
+                creds.refresh(GoogleDriveRequest())
+            except Exception as exc:
+                print(f"[gdrive] Failed to refresh Drive token: {exc}. Requesting new auth.")
+                creds = None
+        if creds is None:
+            try:
+                flow = GoogleDriveInstalledAppFlow.from_client_secrets_file(
+                    str(credentials_path), GOOGLE_DRIVE_SCOPES
+                )
+                creds = flow.run_console()
+            except Exception as exc:
+                print(f"[gdrive] OAuth authorization failed: {exc}")
+                return False
+        if token_path is not None:
+            try:
+                token_path.parent.mkdir(parents=True, exist_ok=True)
+                token_path.write_text(creds.to_json())
+            except Exception as exc:
+                print(f"[gdrive] Failed to store Drive token: {exc}")
+
+    try:
+        service = google_drive_build("drive", "v3", credentials=creds, cache_discovery=False)
+        target_folder_id = parent_folder_id
+        file_metadata = {"name": file_path.name}
+        if target_folder_id:
+            file_metadata["parents"] = [target_folder_id]
+        media = GoogleDriveMediaFileUpload(str(file_path), resumable=True)
+        created = (
+            service.files()
+            .create(body=file_metadata, media_body=media, fields="id, webViewLink")
+            .execute()
+        )
+    except Exception as exc:
+        print(f"[gdrive] Upload failed: {exc}")
+        return False
+
+    file_id = created.get("id")
+    view_link = created.get("webViewLink") or (
+        f"https://drive.google.com/file/d/{file_id}/view" if file_id else None
+    )
+    print(f"[gdrive] Uploaded '{file_path.name}' to Google Drive (file id: {file_id}).")
+    if view_link:
+        print(f"[gdrive] View link: {view_link}")
+    return True
+
+
+def _maybe_archive_and_upload_output(local_rank):
+    if local_rank != 0:
+        return
+    if not OUTPUT_ROOT_DIR.exists():
+        print(f"[gdrive] Output directory '{OUTPUT_ROOT_DIR}' does not exist; skipping upload.")
+        return
+    if not GOOGLE_DRIVE_CREDENTIALS_PATH.exists():
+        print(
+            f"[gdrive] Credential file '{GOOGLE_DRIVE_CREDENTIALS_PATH}' not found; "
+            "skipping Drive upload."
+        )
+        return
+    archive_path = _archive_output_directory(OUTPUT_ROOT_DIR, OUTPUT_ARCHIVE_PATH)
+    if archive_path is None:
+        return
+    uploaded = _upload_file_to_google_drive(
+        archive_path,
+        GOOGLE_DRIVE_CREDENTIALS_PATH,
+        token_path=GOOGLE_DRIVE_TOKEN_PATH,
+        parent_folder_id=GOOGLE_DRIVE_PARENT_ID,
+    )
+    if uploaded:
+        print("[gdrive] Output archive upload completed successfully.")
 
 
 def _prepare_training_manifest_entries(
@@ -818,6 +969,7 @@ def main(opt):
                 net.state_dict(),
                 f"{opt.outf}/final_net_{opt.namefile}_{str(epoch).zfill(4)}.pth"
             )
+            _maybe_archive_and_upload_output(local_rank)
 
         print("end:", datetime.datetime.now().strftime("%m/%d/%Y, %H:%M:%S"))
         print("Total time taken: ", str(datetime.datetime.now() - start_time).split(".")[0])
