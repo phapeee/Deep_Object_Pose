@@ -35,6 +35,9 @@ threadpoolctl
 tifffile
 typing_extensions
 urllib3
+google-api-python-client
+google-auth-httplib2
+google-auth-oauthlib
 
 
 ## If running into dependency issues, install the version-specific requirements below in a virtual environment
