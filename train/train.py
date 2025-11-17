@@ -177,6 +177,20 @@ def _archive_output_directory(source_dir, archive_path):
         return None
 
 
+def _run_drive_auth_flow(flow):
+    console_runner = getattr(flow, "run_console", None)
+    if callable(console_runner):
+        print("[gdrive] Starting console-based OAuth flow...")
+        return console_runner()
+    local_server_runner = getattr(flow, "run_local_server", None)
+    if callable(local_server_runner):
+        print("[gdrive] Starting local-server OAuth flow (a browser window will open)...")
+        return local_server_runner(port=0)
+    raise RuntimeError(
+        "Google auth flow does not provide run_console or run_local_server methods."
+    )
+
+
 def _upload_file_to_google_drive(file_path, credentials_path, token_path=None, parent_folder_id=None):
     if (
         GoogleDriveCredentials is None
@@ -228,7 +242,7 @@ def _upload_file_to_google_drive(file_path, credentials_path, token_path=None, p
                 flow = GoogleDriveInstalledAppFlow.from_client_secrets_file(
                     str(credentials_path), GOOGLE_DRIVE_SCOPES
                 )
-                creds = flow.run_console()
+                creds = _run_drive_auth_flow(flow)
             except Exception as exc:
                 print(f"[gdrive] OAuth authorization failed: {exc}")
                 return False
