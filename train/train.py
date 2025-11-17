@@ -57,15 +57,7 @@ if COMMON_DIR not in sys.path:
 OUTPUT_ROOT_DIR = Path(ROOT_DIR) / "output"
 OUTPUT_ARCHIVE_PATH = Path(ROOT_DIR) / "output.tar"
 GOOGLE_DRIVE_CREDENTIALS_PATH = Path(ROOT_DIR) / "gg_drive_credential.json"
-_DEFAULT_TOKEN_PATH = Path(ROOT_DIR) / "gg_drive_token.json"
-_WORKSPACE_TOKEN_PATH = Path(ROOT_DIR).parent / "token.json"
-_ENV_TOKEN_PATH = os.environ.get("DOPE_GDRIVE_TOKEN_PATH")
-if _ENV_TOKEN_PATH:
-    GOOGLE_DRIVE_TOKEN_PATH = Path(_ENV_TOKEN_PATH).expanduser()
-elif _WORKSPACE_TOKEN_PATH.exists():
-    GOOGLE_DRIVE_TOKEN_PATH = _WORKSPACE_TOKEN_PATH
-else:
-    GOOGLE_DRIVE_TOKEN_PATH = _DEFAULT_TOKEN_PATH
+GOOGLE_DRIVE_TOKEN_PATH = Path(ROOT_DIR) / "token.json"
 GOOGLE_DRIVE_SCOPES = ["https://www.googleapis.com/auth/drive.file"]
 GOOGLE_DRIVE_PARENT_ID = os.environ.get("DOPE_GDRIVE_FOLDER_ID")
 
