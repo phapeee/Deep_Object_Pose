@@ -960,7 +960,7 @@ def main(opt):
                 raise _AutoBatchRestart(auto_batch_ctx.get("restart_batch_size", opt.batchsize))
 
             try:
-                if local_rank == 0 and epoch > 0 and epoch % opt.save_every == 0:
+                if local_rank == 0 and epoch % opt.save_every == 0:
                     out_fn = f"{opt.outf}/net_{opt.namefile}_{str(epoch).zfill(4)}.pth"
                     torch.save(net.state_dict(), out_fn)
 
