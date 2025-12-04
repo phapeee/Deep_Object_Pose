@@ -22,7 +22,6 @@ RUN python3 -m pip install --upgrade pip && \
 
 # Expect host repo mounted at /workspace/Deep_Object_Pose when running.
 WORKDIR /workspace/Deep_Object_Pose
-VOLUME ["/workspace/Deep_Object_Pose"]
 
 # Quick sanity print on container start (optional).
 CMD bash -lc '\
