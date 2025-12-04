@@ -57,13 +57,24 @@ Optional emissive/object properties can be defined via `config/object_properties
 ```
 During generation the mesh whose name contains `LED` will get an emissive material with a randomly chosen color from the list.
 
+# Compute Bounding Box Dimensions
+```bash
+# in project root
+python3 ./train/compute_bbox_dimensions.py --object Antenna --show_parts
+```
+
 # Training Data
 ```bash
 # in project root
-torchrun --nproc_per_node=1 train/train.py --data  ./data/KetchupData --object Ketchup --epochs 5 --save_every 5
+torchrun --nproc_per_node=1 train/train.py --data ./data/AntennaTrainingData --object Antenna --epochs 1 --save_every 1 --batchsize 10 --nb_checkpoints 1 --workers 20 --auto_batchsize --loginterval 1 --auto_batch_headroom 0.2
 ```
 
 # Validate Data
+```bash
+python3 ./train/validate_training_data.py --data ./data/AntennaTrainingData
+```
+
+# Show Data
 ```bash
 python3 ./data_generation/validate_data.py ./data/AntennaData/0/*.json
 ```
@@ -71,13 +82,19 @@ python3 ./data_generation/validate_data.py ./data/AntennaData/0/*.json
 # Generate Test data
 ```bash
 # in project root
-python3 ./data_generation/blenderproc_data_gen/run_blenderproc_datagen.py --nb_runs 8 --frames_per_cycle 1000 --path_single_obj ./data/models/antenna/antenna.obj --nb_objects 1 --object_class Antenna --distractors_folder ./data/google_scanned_models/ --nb_distractors 5 --backgrounds_folder ./data/dome_hdri_haven/ --outf ./data/AntennaData
+python3 ./data_generation/blenderproc_data_gen/run_blenderproc_datagen.py --nb_runs 8 --frames_per_cycle 1 --path_single_obj ./data/models/antenna/antenna.obj --nb_objects 1 --object_class Antenna --distractors_folder ./data/google_scanned_models/ --nb_distractors 5 --backgrounds_folder ./data/dome_hdri_haven/ --outf ./data/AntennaData
+```
+
+# Evaluation
+```bash
+# in project root
+python3 ./evaluate/evaluate.py --data_prediction ./output/net_epoch_0094 --data ./data/AntennaTestData --models ./data/models/antenna/antenna.obj
 ```
 
 # Image Inference
 ```bash
 # in project root
-python3 ./inference/inference.py --config_dir ./config --object Ketchup --parallel --weights ./weights/Ketchup.pth --data ./data/KetchupTest/
+python3 ./inference/inference.py --config_dir ./config --object antenna --parallel --weights ./weights/net_epoch_0094.pth --data ./data/AntennaTestData/
 ```
 
 # Camera Inference

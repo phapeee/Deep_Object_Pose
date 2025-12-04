@@ -1,0 +1,42 @@
+{
+  "data": [
+    "./data/AntennaTrainingData"
+  ],
+  "use_s3": false,
+  "train_buckets": [],
+  "endpoint": null,
+  "object": [
+    "Antenna"
+  ],
+  "val_data": [
+    "./data/AntennaValData"
+  ],
+  "validate_every": 2,
+  "val_batchsize": 10,
+  "val_workers": 10,
+  "val_max_batches": 0,
+  "workers": 20,
+  "batchsize": 256,
+  "auto_batchsize": false,
+  "auto_batch_headroom": 1e9,
+  "auto_batch_max": 300,
+  "imagesize": 448,
+  "lr": 0.0001,
+  "net_path": null,
+  "namefile": "epoch",
+  "manualseed": null,
+  "epochs": 100000,
+  "loginterval": 1,
+  "outf": "output/weights",
+  "nb_checkpoints": 1,
+  "save_every": 1,
+  "max_runtime_seconds": 0,
+  "time_threshold_seconds": 200000,
+  "sigma": 4,
+  "accuracy_px_tolerance": 5.0,
+  "save": false,
+  "auto_batch_cooldown": 40,
+  "auto_batch_samples": 5,
+  "auto_batch_debug": true,
+  "auto_batch_stable_checks": 20
+}

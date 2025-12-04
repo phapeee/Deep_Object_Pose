@@ -14,3 +14,4 @@ __pycache__/
 *.synctex.gz
 .vscode/
 .DS_Store
+TensorRT-10.3.0.26.Linux.x86_64-gnu.cuda-12.5.tar.gz

@@ -15,7 +15,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates gnupg2 software-properties-common wget curl \
     build-essential cmake git pkg-config \
     python3.10 python3-pip python3-dev \
-    blender libsm6 libgl1 \
+    blender libsm6 libgl1 libxi6 libxkbcommon0 \
     && rm -rf /var/lib/apt/lists/*
 
 # Add NVIDIA CUDA apt repo + pin (so we can pin cuDNN 9.3 exactly)
@@ -49,9 +49,12 @@ ENV PATH=/usr/local/cuda/bin:${PATH}
 # Keep dependencies baked into the image but mount the workspace at runtime (see docker-compose.yml).
 WORKDIR /workspace
 COPY Deep_Object_Pose/requirements.txt /tmp/requirements.txt
+# Install project deps plus BlenderProc so `blenderproc run …` works inside the container.
 RUN python3 -m pip install --no-cache-dir -r /tmp/requirements.txt && \
-    python3 -m pip install --no-cache-dir blenderproc pyquaternion && \
+    python3 -m pip install --no-cache-dir "blenderproc>=2.6.0" pyquaternion && \
+    ln -sf /usr/local/bin/blenderproc /usr/bin/blenderproc && \
     rm /tmp/requirements.txt
+# BlenderProc embeds its own Python; install extra modules there as well.
 RUN blenderproc pip install pyquaternion "numpy>=1.25.2,<2.1"
 
 # Expect the host repository to be bind-mounted at /workspace/Deep_Object_Pose when the container runs.

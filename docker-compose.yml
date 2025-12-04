@@ -8,6 +8,8 @@ services:
     working_dir: /workspace/Deep_Object_Pose
     volumes:
       - ./Deep_Object_Pose:/workspace/Deep_Object_Pose
+    ports:
+      - "6006:6006"
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility

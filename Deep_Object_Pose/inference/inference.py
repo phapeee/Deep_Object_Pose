@@ -20,6 +20,18 @@ from cuboid import Cuboid3d
 from cuboid_pnp_solver import CuboidPNPSolver
 from detector import ModelData, ObjectDetector
 from utils import loadimages_inference, loadweights, Draw
+from pyrr import Quaternion
+
+
+FRAME_CONVERSION_MATRIX = np.array(
+    [
+        [1.0, 0.0, 0.0],
+        [0.0, -1.0, 0.0],
+        [0.0, 0.0, -1.0],
+    ],
+    dtype=float,
+)
+FRAME_CONVERSION_ROTATION = Quaternion.from_x_rotation(np.pi)
 
 
 class DopeNode(object):
@@ -130,13 +142,20 @@ class DopeNode(object):
             if result["location"] is None:
                 continue
 
-            loc = result["location"]
+            loc = np.array(result["location"], dtype=float)
             ori = result["quaternion"]
+            if not isinstance(ori, Quaternion):
+                ori = Quaternion(ori)
+
+            # Convert from the OpenCV camera frame (returned by PnP)
+            # into the NDDS/Blender frame used by the training data.
+            loc = FRAME_CONVERSION_MATRIX.dot(loc)
+            ori = FRAME_CONVERSION_ROTATION * ori
 
             dict_out["objects"].append(
                 {
                     "class": self.class_name,
-                    "location": np.array(loc).tolist(),
+                    "location": loc.tolist(),
                     "quaternion_xyzw": np.array(ori).tolist(),
                     "projected_cuboid": np.array(result["projected_points"]).tolist(),
                 }
