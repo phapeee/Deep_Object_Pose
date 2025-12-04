@@ -1,0 +1,37 @@
+# Jetson Orin Nano – JetPack 6.2 (L4T r36.x) lightweight runtime
+# CUDA, cuDNN, TensorRT, and PyTorch come preinstalled in this base image.
+ARG L4T_TAG=r36.4.0
+FROM nvcr.io/nvidia/l4t-pytorch:${L4T_TAG}-pth2.4-py3
+
+ARG DEBIAN_FRONTEND=noninteractive
+
+# Minimal system deps for OpenCV/visualization and Python builds
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3-pip python3-dev build-essential git \
+    libgl1 libglib2.0-0 libsm6 libxext6 libxrender1 libxkbcommon0 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /workspace
+COPY Deep_Object_Pose/requirements.txt /tmp/requirements.txt
+
+# Keep the Jetson-provided torch/torchvision; install remaining Python deps.
+RUN python3 -m pip install --upgrade pip && \
+    python3 -m pip install --no-cache-dir --extra-index-url https://pypi.ngc.nvidia.com \
+        -r /tmp/requirements.txt && \
+    rm /tmp/requirements.txt
+
+# Expect host repo mounted at /workspace/Deep_Object_Pose when running.
+WORKDIR /workspace/Deep_Object_Pose
+VOLUME ["/workspace/Deep_Object_Pose"]
+
+# Quick sanity print on container start (optional).
+CMD bash -lc '\
+    echo "CUDA:" && nvcc --version; \
+    echo "\nTensorRT:" && dpkg -l | grep TensorRT || true; \
+    python3 - <<PY \
+import torch, torchvision, sys; \
+print("Python:", sys.version.split()[0]); \
+print("PyTorch:", torch.__version__); \
+print("Torchvision:", torchvision.__version__); \
+print("CUDA available:", torch.cuda.is_available()) \
+PY'
